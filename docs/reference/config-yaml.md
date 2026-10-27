@@ -319,7 +319,8 @@ not an unbounded workspace history replay.
 | `stats` | string / `summary` | `off`, `summary`, `detailed`; invalid uses summary | Immediate |
 | `slash_command` | string / unset | Bot-token Slack command | Restart required |
 | `job_command` | string / `$job` | Prefix for background work; empty disables | Restart Slack |
-| `alert_target` | string / unset | Slack channel or DM id for cron/job failure alerts; unset disables alerts | Restart jobs and cron |
+| `alert_target` | string / unset | Slack channel or DM id for alerts: cron and job failures, a Slack message handler that raises (at most one alert per 30 minutes), and a failed startup canary; unset disables alerts | Restart chat, jobs and cron |
+| `startup_canary` | boolean / `false` | At startup, run one agent turn that must answer `PONG`; a failure is logged, shown in the dashboard and `claude-tui status`, and sent to `alert_target`. Costs one agent turn per start | Restart Slack |
 | `session_cap` | positive integer / `1000` | Retained thread sessions; invalid uses default | Immediate |
 | `reply_soft_limit` | positive integer / `10` | Turns admitted per thread before `$continue` is required; a turn counts when it reaches the agent, so messages queued behind a running one are counted too | Immediate |
 | `reply_limit_notice_seconds` | non-negative number / `0` | Seconds the `$continue` notice is held before posting, so it lands after the sender's burst rather than between two of their messages; `0` posts it immediately | Immediate |
@@ -373,7 +374,7 @@ event has run.
 |---|---|---|---|
 | `allowed_user_id` | integer / required | Sole authorized user and fallback approval DM | Immediate |
 | `stats` | string / `summary` | `off`, `summary`, or `detailed` | Immediate |
-| `alert_target` | integer / unset | Telegram chat id for cron/job failure alerts; unset disables alerts | Restart jobs and cron |
+| `alert_target` | integer / unset | Telegram chat id for alerts: cron and job failures, and the Slack daemon's own failures; unset disables alerts | Restart chat, jobs and cron |
 | `personas` | mapping / empty | Per-chat instructions file, keyed by chat id or `default` | Immediate |
 
 Changing `allowed_user_id` immediately revokes the previous ID for messages and approval

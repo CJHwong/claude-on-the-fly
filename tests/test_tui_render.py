@@ -16,6 +16,7 @@ from claude_on_the_fly.tui.render import (
     chat_header,
     fmt_in,
     frontends_table,
+    health_notes,
     jobs_header,
     read_new_lines,
     render_snapshot_json,
@@ -162,6 +163,45 @@ class TestChatHeader:
         # The selected cell is wrapped in reverse video; the other isn't.
         assert "[reverse] slack" in line
         assert "[reverse] telegram" not in line
+
+
+class TestHealthNotes:
+    def _fe(self, name, extra):
+        return FrontendStatus(
+            name=name, state="running", last_heartbeat_age_s=2.0, extra=extra
+        )
+
+    def test_a_healthy_daemon_has_no_notes(self):
+        extra = {"handler": {"failures": 0}, "canary": {"ok": True}}
+        assert health_notes(extra) == []
+        assert health_notes({}) == []
+
+    def test_failures_and_a_failed_canary_are_named(self):
+        extra = {"handler": {"failures": 52}, "canary": {"ok": False}}
+        assert health_notes(extra) == ["52 handler failure(s)", "canary failed"]
+
+    def test_malformed_extras_are_ignored(self):
+        assert health_notes({"handler": "x", "canary": "y"}) == []
+        assert health_notes({"handler": {"failures": "3"}}) == []
+
+    def test_the_single_daemon_line_shows_them(self):
+        fe = self._fe("slack", {"handler": {"failures": 2}})
+        line = chat_header([fe], selected=0, active=0)
+        assert "[bold red]2 handler failure(s)[/]" in line
+
+    def test_the_strip_shows_them_on_both_cell_kinds(self):
+        broken = {"canary": {"ok": False}}
+        frontends = [self._fe("slack", broken), self._fe("telegram", broken)]
+        line = chat_header(frontends, selected=0, active=0)
+        assert "[reverse] slack ● canary failed [/reverse]" in line
+        assert "telegram [bold green]●[/] [bold red]canary failed[/]" in line
+
+    def test_the_status_table_adds_them_to_the_notes(self):
+        fe = self._fe("slack", {"queued_turns": 0, "handler": {"failures": 3}})
+        out = TestFrontendsTableWithNestedExtras()._render(
+            frontends_table([fe], datetime(2026, 5, 19, 13, 0, 5, tzinfo=UTC))
+        )
+        assert "queued_turns=0, 3 handler failure(s)" in out
 
 
 class TestRichRender:

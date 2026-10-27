@@ -87,6 +87,12 @@ def test_alert_body_truncates_long_failures() -> None:
     assert len(body) == len("cron entry jira failed\n") + ALERT_BODY_LIMIT + 1
 
 
+def test_alert_body_names_a_daemon_without_the_cron_header() -> None:
+    # A workflow matching `:x: cron` must not take a daemon failure for a cron one.
+    body = _alert_body({"kind": "daemon", "entry": "slack handler"}, _result("boom"))
+    assert body == "slack handler failed\nboom"
+
+
 def test_alert_body_unknown_entry_degrades() -> None:
     body = _alert_body({}, _result("boom"))
     assert body.startswith("cron entry ? failed")
@@ -514,6 +520,21 @@ def test_factory_builds_both_platforms(monkeypatch) -> None:
     )
 
     assert isinstance(sink, CooldownAlertSink)
+
+
+async def test_factory_drops_non_cron_origins_by_default(monkeypatch) -> None:
+    client = _FakeSlackClient()
+    monkeypatch.setattr(
+        "slack_sdk.web.async_client.AsyncWebClient", lambda **kwargs: client
+    )
+    env = {"SLACK_ALERT_TARGET": "C42", "SLACK_TOKEN": "xoxb-t"}
+    daemon = {"kind": "daemon", "entry": "slack handler"}
+
+    await build_alert_sink(env).alert(daemon, _result())
+    assert client.calls == []
+
+    await build_alert_sink(env, cron_only=False).alert(daemon, _result())
+    assert [call["text"] for call in client.calls] == [":x: slack handler failed"]
 
 
 def test_factory_skips_a_target_without_a_token(caplog) -> None:

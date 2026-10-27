@@ -1407,7 +1407,11 @@ class TestEventEmission:
             gate.set()
             await task
 
-        assert orch.heartbeat_extra() == {"running_jobs": [], "queued_turns": 0}
+        assert orch.heartbeat_extra() == {
+            "running_jobs": [],
+            "queued_turns": 0,
+            "handler": {"failures": 0, "last_error": None, "last_handled_at": None},
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -4262,3 +4266,224 @@ class TestLegacyWorkspaceFolding:
             await self._turn(orch, tmp_path)
         assert frontend.sent[0][1].body == "ok"
         assert "not migrated" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Daemon health: handler failures and the startup canary
+# ---------------------------------------------------------------------------
+
+
+def _alert_sink() -> MagicMock:
+    sink = MagicMock()
+    sink.alert = AsyncMock()
+    return sink
+
+
+class TestHandlerHealth:
+    def test_a_handled_event_records_the_time(self, orch: Orchestrator) -> None:
+        orch.note_handler_success()
+        assert orch.heartbeat_extra()["handler"]["last_handled_at"]
+
+    async def test_every_failure_is_counted_and_one_per_window_alerted(
+        self, frontend: StubFrontend, monkeypatch
+    ) -> None:
+        """The alert can land in a chat this daemon serves. One per failure
+        would then feed itself through a broken handler."""
+        clock = [1000.0]
+        monkeypatch.setattr(orchestrator_mod.time, "monotonic", lambda: clock[0])
+        sink = _alert_sink()
+        orch = Orchestrator(frontend, "slack", alert_sink=sink)
+
+        await orch.note_handler_failure(NameError("name 'x' is not defined"))
+        await orch.note_handler_failure(NameError("name 'x' is not defined"))
+
+        handler = orch.heartbeat_extra()["handler"]
+        assert handler["failures"] == 2
+        assert handler["last_error"]["error"] == "NameError: name 'x' is not defined"
+        sink.alert.assert_awaited_once()
+        origin, result = sink.alert.await_args.args
+        assert origin == {"kind": "daemon", "entry": "slack message handler"}
+        assert result.ok is False
+        assert result.text == (
+            "NameError: name 'x' is not defined\n1 failure(s) since start."
+        )
+
+        clock[0] += orchestrator_mod.ALERT_COOLDOWN_S
+        await orch.note_handler_failure(RuntimeError("boom"))
+
+        assert sink.alert.await_count == 2
+        assert sink.alert.await_args.args[1].text == (
+            "RuntimeError: boom\n3 failure(s) since start."
+        )
+
+    async def test_a_failure_without_an_alert_target_is_only_counted(
+        self, orch: Orchestrator
+    ) -> None:
+        await orch.note_handler_failure(RuntimeError("boom"))
+        assert orch.heartbeat_extra()["handler"]["failures"] == 1
+
+    async def test_an_alert_that_cannot_be_sent_does_not_raise(
+        self, frontend: StubFrontend, caplog
+    ) -> None:
+        sink = _alert_sink()
+        sink.alert.side_effect = RuntimeError("slack down")
+        orch = Orchestrator(frontend, "slack", alert_sink=sink)
+
+        await orch.note_handler_failure(RuntimeError("boom"))
+
+        assert orch.heartbeat_extra()["handler"]["failures"] == 1
+        assert "could not deliver the message handler alert" in caplog.text
+
+
+class TestStartupCanary:
+    @pytest.fixture
+    def enabled(self, monkeypatch) -> None:
+        # Padded on purpose: a value with stray whitespace still counts as on.
+        monkeypatch.setenv("SLACK_STARTUP_CANARY", " true ")
+
+    async def _run(self, orch: Orchestrator, **run_kwargs) -> AsyncMock:
+        with patch("claude_on_the_fly.orchestrator.agent") as mock_agent:
+            mock_agent.resolve_profile.return_value = MagicMock(mode="native")
+            mock_agent.run = AsyncMock(**run_kwargs)
+            await orch.run_canary()
+        return mock_agent.run
+
+    async def test_off_by_default_runs_nothing(
+        self, frontend: StubFrontend, monkeypatch
+    ) -> None:
+        monkeypatch.delenv("SLACK_STARTUP_CANARY", raising=False)
+        orch = Orchestrator(frontend, "slack")
+
+        run = await self._run(orch, return_value=Response(body="PONG"))
+
+        run.assert_not_awaited()
+        assert "canary" not in orch.heartbeat_extra()
+
+    @pytest.mark.usefixtures("enabled")
+    async def test_a_pong_passes_without_an_alert(self, frontend: StubFrontend) -> None:
+        sink = _alert_sink()
+        orch = Orchestrator(frontend, "slack", alert_sink=sink)
+
+        run = await self._run(orch, return_value=Response(body="PONG"))
+
+        canary = orch.heartbeat_extra()["canary"]
+        assert canary["ok"] is True
+        assert canary["detail"] == "PONG"
+        assert run.await_args.args[2] == orchestrator_mod.CANARY_PROMPT
+        assert run.await_args.kwargs["timeout"] == orchestrator_mod.CANARY_TIMEOUT_S
+        sink.alert.assert_not_awaited()
+
+    @pytest.mark.usefixtures("enabled")
+    async def test_a_reply_without_pong_fails_and_alerts(
+        self, frontend: StubFrontend
+    ) -> None:
+        sink = _alert_sink()
+        orch = Orchestrator(frontend, "slack", alert_sink=sink)
+
+        await self._run(orch, return_value=Response(body="Not logged in"))
+
+        assert orch.heartbeat_extra()["canary"]["ok"] is False
+        origin, result = sink.alert.await_args.args
+        assert origin == {"kind": "daemon", "entry": "slack startup canary"}
+        assert result.text == "Not logged in"
+
+    @pytest.mark.usefixtures("enabled")
+    async def test_a_reply_that_only_mentions_pong_fails(
+        self, frontend: StubFrontend
+    ) -> None:
+        orch = Orchestrator(frontend, "slack")
+
+        await self._run(orch, return_value=Response(body="I cannot reply PONG now."))
+
+        assert orch.heartbeat_extra()["canary"]["ok"] is False
+
+    @pytest.mark.usefixtures("enabled")
+    async def test_one_session_serves_every_start(self, frontend: StubFrontend) -> None:
+        orch = Orchestrator(frontend, "slack")
+
+        first = await self._run(orch, return_value=Response(body="PONG."))
+        second = await self._run(orch, return_value=Response(body="PONG"))
+
+        assert orch.heartbeat_extra()["canary"]["ok"] is True
+        assert first.await_args.args[1] == second.await_args.args[1]
+
+    @pytest.mark.usefixtures("enabled")
+    async def test_an_agent_error_fails_and_alerts(
+        self, frontend: StubFrontend
+    ) -> None:
+        sink = _alert_sink()
+        orch = Orchestrator(frontend, "slack", alert_sink=sink)
+
+        await self._run(orch, side_effect=ClaudeUnavailableError("usage limit"))
+
+        canary = orch.heartbeat_extra()["canary"]
+        assert canary["ok"] is False
+        assert canary["detail"] == "ClaudeUnavailableError: usage limit"
+        sink.alert.assert_awaited_once()
+
+    @pytest.mark.usefixtures("enabled")
+    async def test_the_detail_is_capped(self, frontend: StubFrontend) -> None:
+        orch = Orchestrator(frontend, "slack")
+
+        await self._run(orch, return_value=Response(body="x" * 1000))
+
+        detail = orch.heartbeat_extra()["canary"]["detail"]
+        assert len(detail) == orchestrator_mod.CANARY_DETAIL_LIMIT
+
+    @pytest.mark.usefixtures("enabled")
+    async def test_a_model_endpoint_is_published_for_the_run_only(
+        self, frontend: StubFrontend, monkeypatch
+    ) -> None:
+        relay = MagicMock()
+        relay.close = AsyncMock()
+        sandbox = MagicMock()
+        sandbox.model_endpoint_env.return_value = {"OLLAMA_HOST": "127.0.0.1:1"}
+        sandbox.open_session_relay = AsyncMock(return_value=relay)
+        sandbox.session_env.return_value = "token"
+        monkeypatch.setattr(orchestrator_mod, "sandbox", sandbox)
+        orch = Orchestrator(frontend, "slack")
+
+        await self._run(orch, side_effect=RuntimeError("boom"))
+
+        sandbox.session_env.assert_called_once_with({"OLLAMA_HOST": "127.0.0.1:1"})
+        sandbox.reset_session_env.assert_called_once_with("token")
+        relay.close.assert_awaited_once()
+
+
+async def test_run_alerts_daemon_failures_and_starts_the_canary(
+    monkeypatch,
+) -> None:
+    """The chat daemon's sink must not be the cron-only one, or nothing fires."""
+    monkeypatch.setattr(
+        orchestrator_mod,
+        "_start_sandbox",
+        AsyncMock(return_value=(None, None, None)),
+    )
+    built: list[dict] = []
+    monkeypatch.setattr(
+        orchestrator_mod,
+        "build_alert_sink",
+        lambda env, **kwargs: built.append(kwargs),
+    )
+    canary = AsyncMock()
+    monkeypatch.setattr(Orchestrator, "run_canary", canary)
+    stub = MagicMock()
+    stub.describe = lambda: {}
+    stub.stop = AsyncMock()
+
+    async def listen(_on_message):
+        await asyncio.sleep(3600)
+
+    stub.start = listen
+    original_wait = asyncio.Event.wait
+
+    async def stop_after_startup(self):
+        await asyncio.sleep(0)
+        self.set()
+        return await original_wait(self)
+
+    monkeypatch.setattr(asyncio.Event, "wait", stop_after_startup)
+    await orchestrator_mod.run(stub, "test")
+
+    assert built == [{"cron_only": False}]
+    canary.assert_awaited_once()

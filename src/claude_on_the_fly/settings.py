@@ -159,6 +159,7 @@ FIELDS: dict[str, Field] = {
     "slack.slash_command": Field("SLACK_SLASH_COMMAND"),
     "slack.job_command": Field("SLACK_JOB_COMMAND"),
     "slack.alert_target": Field("SLACK_ALERT_TARGET"),
+    "slack.startup_canary": Field("SLACK_STARTUP_CANARY"),
     "slack.session_cap": Field("SLACK_SESSION_CAP"),
     "slack.reply_soft_limit": Field("SLACK_REPLY_SOFT_LIMIT"),
     "slack.reply_limit_notice_seconds": Field("SLACK_REPLY_LIMIT_NOTICE_SECONDS"),
@@ -211,10 +212,12 @@ RESTART_REQUIRED = (
     "jobs.timeout",
     # Read once, when the startup sweep runs. An edit lands at the next restart.
     "jobs.workspace_keep_days",
-    # The alert sinks are constructed once, at startup, in both the worker and
-    # the cron producer.
+    # The alert sinks are constructed once, at startup, in the worker, the cron
+    # producer and the chat daemons.
     "slack.alert_target",
     "telegram.alert_target",
+    # The canary runs once, when the Slack daemon starts.
+    "slack.startup_canary",
 )
 
 
