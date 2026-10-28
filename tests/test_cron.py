@@ -35,6 +35,11 @@ def write_config(path: Path, entries: list[dict]) -> Path:
     return path
 
 
+# The scheduled time a test fire carries, and the same as a run receives it.
+WHEN = datetime(2026, 1, 1, 9, 0)
+STAMP = "2026-01-01T09:00:00"
+
+
 def cfg(tmp_path: Path, *entries: dict) -> Path:
     return write_config(tmp_path / "cron.yaml", list(entries))
 
@@ -107,7 +112,7 @@ async def fire_and_settle(cron: CronDaemon, entry: CronEntry) -> None:
     it, so a test that asserts on what a producer *did* has to wait for the task
     itself. Nothing in production waits like this.
     """
-    await cron._fire(entry)
+    await cron._fire(entry, WHEN)
     await asyncio.gather(*list(cron._command_tasks), return_exceptions=True)
 
 
@@ -481,7 +486,7 @@ class TestAdmission:
     def test_an_item_becomes_a_keyed_job(self, tmp_path: Path) -> None:
         queue = FakeQueue()
         cron = daemon(tmp_path, cfg(tmp_path), queue)
-        cron._admit(_producer_entry(), [{"key": "ACE-1", "title": "t"}])
+        cron._admit(_producer_entry(), [{"key": "ACE-1", "title": "t"}], STAMP)
 
         (job,) = queue.jobs
         assert job.key == "jira/ACE-1"
@@ -495,8 +500,8 @@ class TestAdmission:
         queue = FakeQueue()
         cron = daemon(tmp_path, cfg(tmp_path), queue)
         items = [{"key": "ACE-1"}]
-        cron._admit(_producer_entry(), items)
-        cron._admit(_producer_entry(), items)
+        cron._admit(_producer_entry(), items, STAMP)
+        cron._admit(_producer_entry(), items, STAMP)
 
         assert len(queue.jobs) == 1
 
@@ -506,6 +511,7 @@ class TestAdmission:
         cron._admit(
             _producer_entry(max_concurrent=2),
             [{"key": "ACE-1"}, {"key": "ACE-2"}, {"key": "ACE-3"}],
+            STAMP,
         )
 
         assert [j.key for j in queue.jobs] == ["jira/ACE-1", "jira/ACE-2"]
@@ -518,7 +524,7 @@ class TestAdmission:
         for _ in range(3):
             store.record_fire("jira/ACE-1", fingerprint(item))
 
-        cron._admit(_producer_entry(max_fires=3), [item])
+        cron._admit(_producer_entry(max_fires=3), [item], STAMP)
 
         assert queue.jobs == []
 
@@ -529,7 +535,9 @@ class TestAdmission:
         for _ in range(3):
             store.record_fire("jira/ACE-1", fingerprint({"key": "ACE-1", "s": "open"}))
 
-        cron._admit(_producer_entry(max_fires=3), [{"key": "ACE-1", "s": "review"}])
+        cron._admit(
+            _producer_entry(max_fires=3), [{"key": "ACE-1", "s": "review"}], STAMP
+        )
 
         assert len(queue.jobs) == 1
 
@@ -540,7 +548,9 @@ class TestAdmission:
         cron = daemon(tmp_path, cfg(tmp_path), queue)
         entry = _producer_entry(prompt="work {{ item.key }} at {{ item.status }}")
 
-        cron._admit(entry, [{"key": "ACE-1"}, {"key": "ACE-2", "status": "open"}])
+        cron._admit(
+            entry, [{"key": "ACE-1"}, {"key": "ACE-2", "status": "open"}], STAMP
+        )
 
         assert [j.key for j in queue.jobs] == ["jira/ACE-2"]
 
@@ -551,7 +561,7 @@ class TestAdmission:
         cron = daemon(tmp_path, cfg(tmp_path), queue)
         entry = _producer_entry(prompt="work {{ item.titel }}")
 
-        cron._admit(entry, [{"key": "ACE-1"}, {"key": "ACE-2"}])
+        cron._admit(entry, [{"key": "ACE-1"}, {"key": "ACE-2"}], STAMP)
 
         assert queue.jobs == []
         assert "no item could be rendered" in caplog.text
@@ -564,7 +574,7 @@ class TestPlainEntry:
         cron = daemon(tmp_path, cfg(tmp_path), queue)
         entry = CronEntry(name="digest", cron="0 9 * * *", prompt="summarise")
 
-        cron._enqueue_plain(entry)
+        cron._enqueue_plain(entry, STAMP)
 
         (job,) = queue.jobs
         assert job.key == "digest"
@@ -578,8 +588,8 @@ class TestPlainEntry:
         cron = daemon(tmp_path, cfg(tmp_path), queue)
         entry = CronEntry(name="digest", cron="0 9 * * *", prompt="summarise")
 
-        cron._enqueue_plain(entry)
-        cron._enqueue_plain(entry)
+        cron._enqueue_plain(entry, STAMP)
+        cron._enqueue_plain(entry, STAMP)
 
         assert len(queue.jobs) == 1
 
@@ -610,7 +620,9 @@ class TestFire:
         cron = daemon(tmp_path, cfg(tmp_path))
         seen: list[float] = []
 
-        async def record(command: str, *, timeout: float, capture: bool):
+        async def record(
+            command: str, *, timeout: float, capture: bool, scheduled_at: str
+        ):
             seen.append(timeout)
             return "", 0
 
@@ -677,7 +689,7 @@ class TestFire:
         # prompt_file that vanished after load.
         entry = CronEntry(name="a", cron="* * * * *", prompt_file=tmp_path / "gone.md")
 
-        await cron._fire(entry)  # must not raise
+        await cron._fire(entry, WHEN)  # must not raise
 
         assert queue.jobs == []
 
@@ -696,7 +708,7 @@ class TestFire:
         cron = daemon(tmp_path, cfg(tmp_path), queue)
         entry = CronEntry(name="prune", cron="0 4 * * *", command="exit 0", timeout=30)
 
-        await cron._run_side_effect(entry)
+        await cron._run_side_effect(entry, STAMP)
 
         assert queue.jobs == []
         assert any("exit=0" in block for _, block in written)
@@ -706,7 +718,7 @@ class TestFire:
         cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
         entry = CronEntry(name="prune", cron="0 4 * * *", command="exit 1", timeout=30)
 
-        await cron._run_side_effect(entry)
+        await cron._run_side_effect(entry, STAMP)
 
         assert sink.calls == [
             (
@@ -722,7 +734,7 @@ class TestFire:
         cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
         entry = CronEntry(name="prune", cron="0 4 * * *", command="exit 0", timeout=30)
 
-        await cron._run_side_effect(entry)
+        await cron._run_side_effect(entry, STAMP)
 
         assert sink.calls == []
 
@@ -732,7 +744,7 @@ class TestFire:
         cron = daemon(tmp_path, cfg(tmp_path), alert_sink=_RaisingAlertSink())
         entry = CronEntry(name="prune", cron="0 4 * * *", command="exit 1", timeout=30)
 
-        await cron._run_side_effect(entry)  # must not raise
+        await cron._run_side_effect(entry, STAMP)  # must not raise
 
 
 class TestProducerOffTheLoop:
@@ -811,8 +823,8 @@ class TestProducerOffTheLoop:
         entry = _producer_entry(command='sleep 2; printf \'{"key":"ACE-1"}\\n\'')
 
         with caplog.at_level("INFO", logger="claude_on_the_fly.cron"):
-            await cron._fire(entry)
-            await cron._fire(entry)
+            await cron._fire(entry, WHEN)
+            await cron._fire(entry, WHEN)
 
         assert len([t for t in cron._command_tasks if t.get_name() == "jira"]) == 1
         assert "still running, skipping this fire" in caplog.text
@@ -830,7 +842,7 @@ class TestProducerOffTheLoop:
         entry = _producer_entry(command='printf \'{"key":"ACE-1"}\\n\'')
 
         await fire_and_settle(cron, entry)
-        await cron._fire(entry)
+        await cron._fire(entry, WHEN)
         await asyncio.gather(*list(cron._command_tasks))
 
         assert [j.key for j in queue.jobs] == ["jira/ACE-1"]
@@ -891,7 +903,7 @@ class TestProducerOffTheLoop:
         and names it. The work is not lost: the next fire polls again."""
         cron = daemon(tmp_path, cfg(tmp_path), FakeQueue())
 
-        await cron._fire(_producer_entry(command="sleep 30"))
+        await cron._fire(_producer_entry(command="sleep 30"), WHEN)
         assert cron._running_command_names() == ["jira"]
         await cron.stop()
 
@@ -950,7 +962,7 @@ class TestStop:
     async def test_stop_cancels_a_running_side_effect(self, tmp_path: Path) -> None:
         cron = daemon(tmp_path, cfg(tmp_path))
         entry = CronEntry(name="slow", cron="* * * * *", command="sleep 30", timeout=60)
-        cron._spawn_command(entry)
+        cron._spawn_command(entry, STAMP)
         await asyncio.sleep(0.05)
 
         await cron.stop()
@@ -964,7 +976,8 @@ class TestStop:
         has to open every entry's log to find which run died."""
         cron = daemon(tmp_path, cfg(tmp_path))
         cron._spawn_command(
-            CronEntry(name="slow", cron="* * * * *", command="sleep 30", timeout=60)
+            CronEntry(name="slow", cron="* * * * *", command="sleep 30", timeout=60),
+            STAMP,
         )
         await asyncio.sleep(0.05)
 
@@ -992,7 +1005,8 @@ class TestStop:
         assert cron.heartbeat_extra() == {"running_commands": []}
 
         cron._spawn_command(
-            CronEntry(name="slow", cron="* * * * *", command="sleep 30", timeout=60)
+            CronEntry(name="slow", cron="* * * * *", command="sleep 30", timeout=60),
+            STAMP,
         )
         await asyncio.sleep(0.05)
 
@@ -1531,7 +1545,7 @@ class TestUnknownKeyIsFatalOnlyAtStartup:
 
         _os.utime(path, (0, 0))
         cron._maybe_reload()
-        await cron._fire(cron._state["a"].entry)
+        await cron._fire(cron._state["a"].entry, WHEN)
 
         assert [j.key for j in queue.jobs] == ["a"]
 
@@ -1552,7 +1566,7 @@ class TestRunLoop:
         )
         fired: list[str] = []
 
-        async def record(entry):
+        async def record(entry, scheduled=None):
             fired.append(entry.name)
             await cron.stop()
 
@@ -1588,7 +1602,7 @@ class TestRunLoop:
         cron._print_summary = lambda: None  # type: ignore[method-assign]
         fired: list[str] = []
 
-        async def record(entry):
+        async def record(entry, scheduled=None):
             fired.append(entry.name)
             await cron.stop()
 
@@ -1653,7 +1667,7 @@ class TestRunLoop:
         )
         entry = CronEntry(name="a", cron="* * * * *", prompt="x")
         with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
-            await cron._fire(entry)
+            await cron._fire(entry, WHEN)
         assert "fire failed" in "\n".join(r.getMessage() for r in caplog.records)
 
 
@@ -1995,7 +2009,7 @@ class TestSideEffectCommandFailures:
         )
         entry = CronEntry(name="prune", cron="0 4 * * *", command="whatever", timeout=5)
         with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
-            await cron._run_side_effect(entry)
+            await cron._run_side_effect(entry, STAMP)
         assert any("could not start" in block for _, block in written)
         assert "command failed to start" in "\n".join(
             r.getMessage() for r in caplog.records
@@ -2018,7 +2032,7 @@ class TestSideEffectCommandFailures:
         )
         entry = CronEntry(name="slow", cron="0 4 * * *", command="sleep 30", timeout=1)
         object.__setattr__(entry, "timeout", 1)
-        await cron._run_side_effect(entry)
+        await cron._run_side_effect(entry, STAMP)
         assert any("timed out after" in block for _, block in written)
 
     async def test_a_shutdown_mid_command_is_recorded_and_re_raised(
@@ -2039,7 +2053,7 @@ class TestSideEffectCommandFailures:
             FakeQueue(),
         )
         entry = CronEntry(name="slow", cron="0 4 * * *", command="sleep 30", timeout=60)
-        task = asyncio.create_task(cron._run_side_effect(entry))
+        task = asyncio.create_task(cron._run_side_effect(entry, STAMP))
         await asyncio.sleep(0.2)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2060,7 +2074,7 @@ class TestProducerWithNoItems:
             queue,
         )
         with caplog.at_level("DEBUG", logger="claude_on_the_fly.cron"):
-            await cron._fire_producer(_producer_entry(command="true"))
+            await cron._fire_producer(_producer_entry(command="true"), STAMP)
         assert queue.jobs == []
         assert "emitted no items" in "\n".join(r.getMessage() for r in caplog.records)
 
@@ -2076,7 +2090,7 @@ class TestRunCommand:
         )
         with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
             out, rc = await cron._run_command(
-                "echo oops >&2; echo fine", timeout=10, capture=True
+                "echo oops >&2; echo fine", timeout=10, capture=True, scheduled_at=STAMP
             )
         assert out.strip() == "fine"
         assert rc == 0
@@ -2092,7 +2106,9 @@ class TestRunCommand:
             cfg(tmp_path, {"name": "a", "cron": "* * * * *", "prompt": "x"}),
             FakeQueue(),
         )
-        out, rc = await cron._run_command("sleep 30", timeout=0.2, capture=True)
+        out, rc = await cron._run_command(
+            "sleep 30", timeout=0.2, capture=True, scheduled_at=STAMP
+        )
         assert "timed out after 0.2s" in out
         assert rc is None
 
@@ -2111,7 +2127,10 @@ class TestRunCommand:
         )
         with caplog.at_level("ERROR", logger="claude_on_the_fly.cron"):
             out, _rc = await cron._run_command(
-                "printf 'x%.0s' $(seq 1 200)", timeout=10, capture=True
+                "printf 'x%.0s' $(seq 1 200)",
+                timeout=10,
+                capture=True,
+                scheduled_at=STAMP,
             )
         assert len(out) == 32
         assert "truncating to 32" in "\n".join(r.getMessage() for r in caplog.records)
@@ -2223,7 +2242,7 @@ class TestSideEffectFiresInTheBackground:
             FakeQueue(),
         )
         entry = CronEntry(name="slow", cron="0 4 * * *", command="sleep 30", timeout=60)
-        await cron._fire(entry)
+        await cron._fire(entry, WHEN)
         assert len(cron._command_tasks) == 1, "the fire waited for the command"
         await cron.stop()
         assert cron._command_tasks == set() or all(
@@ -2446,7 +2465,7 @@ class TestOneShotAt:
         cron._sleep_to_next_minute = immediately  # type: ignore[method-assign]
         fired: list[str] = []
 
-        async def record(entry):
+        async def record(entry, scheduled=None):
             fired.append(entry.name)
 
         cron._fire = record  # type: ignore[method-assign]
@@ -2503,7 +2522,7 @@ class TestOneShotAt:
         cron._print_summary = lambda: None  # type: ignore[method-assign]
         fired: list[str] = []
 
-        async def record(entry):
+        async def record(entry, scheduled=None):
             fired.append(entry.name)
 
         cron._fire = record  # type: ignore[method-assign]
@@ -2511,3 +2530,280 @@ class TestOneShotAt:
         await asyncio.wait_for(cron.run(), timeout=5)
         assert fired == []
         assert cron._state["later"].next_fire == datetime(2098, 1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Missed fires across a stop
+# ---------------------------------------------------------------------------
+
+
+def _missed_daemon(
+    tmp_path: Path, entry: dict, sink=None
+) -> tuple[CronDaemon, FakeQueue]:
+    queue = FakeQueue()
+    cron = daemon(tmp_path, cfg(tmp_path, entry), queue, alert_sink=sink)
+    cron.reload()
+    return cron, queue
+
+
+def _hourly(**extra) -> dict:
+    return {
+        "name": "a",
+        "cron": "0 * * * *",
+        "prompt": "run for {{ scheduled_at }}",
+        **extra,
+    }
+
+
+class TestMissedFires:
+    async def test_five_misses_with_catch_up_fire_once_for_the_latest(
+        self, tmp_path: Path
+    ) -> None:
+        sink = _RecordingAlertSink()
+        cron, queue = _missed_daemon(tmp_path, _hourly(catch_up="2h"), sink)
+        cron._record_schedule(cron._state["a"].entry, datetime(2026, 1, 1, 9, 0))
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 14, 30))
+
+        assert [job.prompt for job in queue.jobs] == ["run for 2026-01-01T14:00:00"]
+        assert cron._last_scheduled(cron._state["a"].entry) == datetime(
+            2026, 1, 1, 14, 0
+        )
+        assert len(sink.calls) == 1
+        origin, result = sink.calls[0]
+        assert origin == {"kind": "daemon", "entry": "claude-cron"}
+        assert "a x5 (last 2026-01-01T14:00:00), caught up once" in result.text
+
+    async def test_a_miss_older_than_the_window_logs_and_alerts_but_does_not_fire(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        sink = _RecordingAlertSink()
+        cron, queue = _missed_daemon(tmp_path, _hourly(catch_up="10m"), sink)
+        cron._record_schedule(cron._state["a"].entry, datetime(2026, 1, 1, 9, 0))
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
+            await cron._catch_up_missed(datetime(2026, 1, 1, 11, 30))
+
+        assert queue.jobs == []
+        assert "cron: missed a x2 (last 2026-01-01T11:00:00)" in caplog.text
+        assert "caught up" not in sink.calls[0][1].text
+        assert cron._last_scheduled(cron._state["a"].entry) == datetime(
+            2026, 1, 1, 11, 30
+        )
+
+    async def test_an_entry_without_catch_up_never_replays(
+        self, tmp_path: Path
+    ) -> None:
+        sink = _RecordingAlertSink()
+        cron, queue = _missed_daemon(tmp_path, _hourly(), sink)
+        cron._record_schedule(cron._state["a"].entry, datetime(2026, 1, 1, 9, 0))
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 10, 5))
+
+        assert queue.jobs == []
+        assert "a x1 (last 2026-01-01T10:00:00)" in sink.calls[0][1].text
+
+    async def test_a_first_start_records_now_and_replays_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        sink = _RecordingAlertSink()
+        cron, queue = _missed_daemon(tmp_path, _hourly(catch_up="1d"), sink)
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 10, 5))
+
+        assert queue.jobs == []
+        assert sink.calls == []
+        assert cron._last_scheduled(cron._state["a"].entry) == datetime(
+            2026, 1, 1, 10, 5
+        )
+
+    async def test_a_restart_with_nothing_missed_sends_no_alert(
+        self, tmp_path: Path
+    ) -> None:
+        sink = _RecordingAlertSink()
+        cron, queue = _missed_daemon(tmp_path, _hourly(catch_up="1d"), sink)
+        cron._record_schedule(cron._state["a"].entry, datetime(2026, 1, 1, 10, 0))
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 10, 40))
+
+        assert queue.jobs == []
+        assert sink.calls == []
+
+    async def test_an_edited_expression_does_not_count_the_old_one(
+        self, tmp_path: Path
+    ) -> None:
+        sink = _RecordingAlertSink()
+        cron, queue = _missed_daemon(tmp_path, _hourly(catch_up="1d"), sink)
+        old = CronEntry(name="a", cron="*/10 * * * *", prompt="x")
+        cron._record_schedule(old, datetime(2026, 1, 1, 9, 0))
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 12, 5))
+
+        assert queue.jobs == []
+        assert sink.calls == []
+        assert cron._last_scheduled(cron._state["a"].entry) == datetime(
+            2026, 1, 1, 12, 5
+        )
+
+    async def test_an_unreadable_record_counts_as_no_record(
+        self, tmp_path: Path
+    ) -> None:
+        cron, queue = _missed_daemon(tmp_path, _hourly(catch_up="1d"))
+        entry = cron._state["a"].entry
+        store = cron._key_state
+        state = store.load(cron._schedule_key(entry))
+        state.extras = {"scheduled_at": "not a time", "cron": entry.cron}
+        store.save(cron._schedule_key(entry), state)
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 12, 5))
+
+        assert queue.jobs == []
+
+    async def test_a_long_outage_reports_a_floor_not_an_exact_count(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(cron_mod, "MAX_MISSED_COUNT", 3)
+        sink = _RecordingAlertSink()
+        cron, _queue = _missed_daemon(tmp_path, _hourly(), sink)
+        cron._record_schedule(cron._state["a"].entry, datetime(2026, 1, 1, 9, 0))
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 20, 0))
+
+        assert "a x3+ (last 2026-01-01T20:00:00)" in sink.calls[0][1].text
+
+    async def test_one_alert_names_every_entry(self, tmp_path: Path) -> None:
+        sink = _RecordingAlertSink()
+        queue = FakeQueue()
+        cron = daemon(
+            tmp_path,
+            cfg(tmp_path, _hourly(), {**_hourly(), "name": "b"}),
+            queue,
+            alert_sink=sink,
+        )
+        cron.reload()
+        for name in ("a", "b"):
+            cron._record_schedule(cron._state[name].entry, datetime(2026, 1, 1, 9, 0))
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 10, 5))
+
+        assert len(sink.calls) == 1
+        assert "a x1" in sink.calls[0][1].text
+        assert "b x1" in sink.calls[0][1].text
+
+    async def test_one_shot_entries_are_left_to_their_own_rule(
+        self, tmp_path: Path
+    ) -> None:
+        sink = _RecordingAlertSink()
+        cron, queue = _missed_daemon(
+            tmp_path, {"name": "once", "at": "2026-01-01 09:00", "prompt": "x"}, sink
+        )
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 10, 5))
+
+        assert queue.jobs == []
+        assert sink.calls == []
+
+    async def test_a_dead_alert_channel_does_not_stop_the_start(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        cron, _queue = _missed_daemon(tmp_path, _hourly(), _RaisingAlertSink())
+        cron._record_schedule(cron._state["a"].entry, datetime(2026, 1, 1, 9, 0))
+
+        await cron._catch_up_missed(datetime(2026, 1, 1, 10, 5))
+
+        assert "could not alert the missed fires" in caplog.text
+
+    async def test_no_alert_sink_still_logs(self, tmp_path: Path, caplog) -> None:
+        cron, _queue = _missed_daemon(tmp_path, _hourly())
+        cron._record_schedule(cron._state["a"].entry, datetime(2026, 1, 1, 9, 0))
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.cron"):
+            await cron._catch_up_missed(datetime(2026, 1, 1, 10, 5))
+
+        assert "cron: missed a x1" in caplog.text
+
+    def test_a_record_that_cannot_be_written_is_logged(
+        self, tmp_path: Path, caplog, monkeypatch
+    ) -> None:
+        cron, _queue = _missed_daemon(tmp_path, _hourly())
+
+        def broken(key, state):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(cron._key_state, "save", broken)
+        cron._record_schedule(cron._state["a"].entry, datetime(2026, 1, 1, 9, 0))
+
+        assert "could not record its scheduled fire" in caplog.text
+
+    async def test_a_scheduled_fire_records_its_scheduled_time(
+        self, tmp_path: Path
+    ) -> None:
+        cron, _queue = _missed_daemon(tmp_path, _hourly())
+        due = datetime(2026, 1, 1, 9, 0)
+        cron._state["a"].next_fire = due
+        fired: list[datetime] = []
+
+        async def record(entry, scheduled=None):
+            fired.append(scheduled)
+            await cron.stop()
+
+        async def immediately():
+            return None
+
+        async def nothing_missed(now):
+            return None
+
+        cron._fire = record  # type: ignore[method-assign]
+        cron._catch_up_missed = nothing_missed  # type: ignore[method-assign]
+        cron._sleep_to_next_minute = immediately  # type: ignore[method-assign]
+        cron.reload = lambda: (set(), set(), set())  # type: ignore[method-assign]
+        cron._print_summary = lambda: None  # type: ignore[method-assign]
+
+        await asyncio.wait_for(cron.run(), timeout=5)
+
+        assert fired == [due]
+        assert cron._last_scheduled(cron._state["a"].entry) == due
+
+
+class TestScheduledAt:
+    async def test_a_command_gets_it_in_its_environment(self, tmp_path: Path) -> None:
+        cron = daemon(tmp_path, cfg(tmp_path))
+        out, rc = await cron._run_command(
+            "echo $COTF_SCHEDULED_AT", timeout=10, capture=True, scheduled_at=STAMP
+        )
+        assert (out.strip(), rc) == (STAMP, 0)
+
+    def test_a_producer_item_prompt_can_use_it(self, tmp_path: Path) -> None:
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path), queue)
+        entry = _producer_entry(prompt="{{ item.key }} at {{ scheduled_at }}")
+        cron._admit(entry, [{"key": "ACE-1"}], STAMP)
+        assert queue.jobs[0].prompt == f"ACE-1 at {STAMP}"
+
+    def test_a_plain_prompt_using_it_loads(self, tmp_path: Path) -> None:
+        entries = load_config(cfg(tmp_path, _hourly()))
+        assert entries[0].prompt == "run for {{ scheduled_at }}"
+
+
+class TestCatchUpConfig:
+    def test_a_window_is_read_in_seconds(self, tmp_path: Path) -> None:
+        entries = load_config(cfg(tmp_path, _hourly(catch_up="90m")))
+        assert entries[0].catch_up == 5400
+
+    def test_it_is_off_by_default(self, tmp_path: Path) -> None:
+        assert load_config(cfg(tmp_path, _hourly()))[0].catch_up is None
+
+    @pytest.mark.parametrize("value", ["10", "0m", "soon", 600])
+    def test_a_bad_window_is_rejected(self, tmp_path: Path, value) -> None:
+        with pytest.raises(ValueError, match="'catch_up' must be a window"):
+            load_config(cfg(tmp_path, _hourly(catch_up=value)))
+
+    def test_a_one_shot_entry_cannot_have_one(self, tmp_path: Path) -> None:
+        entry = {
+            "name": "once",
+            "at": "2030-01-01 09:00",
+            "prompt": "x",
+            "catch_up": "1h",
+        }
+        with pytest.raises(ValueError, match="'catch_up' needs 'cron'"):
+            load_config(cfg(tmp_path, entry))

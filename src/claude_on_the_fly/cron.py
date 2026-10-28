@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -35,7 +36,7 @@ import sys
 import time
 from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
@@ -62,6 +63,16 @@ _NEVER_FIRE = datetime.max
 # Fingerprint every one-shot fire is recorded under, so `should_skip` sees an
 # unchanged item no matter how many times it fires.
 _ONE_SHOT_FINGERPRINT = "one-shot"
+# Key-state item under which a recurring entry's last scheduled fire is kept, as
+# `<entry>/@schedule`. Not the entry's own key: the job worker writes that one on
+# every outcome, from another process, and two writers of one file lose updates.
+_SCHEDULE_ITEM = "@schedule"
+# Most missed occurrences counted for one entry. An every-minute entry stopped for
+# a week has ten thousand; past this the count shows as "10000+".
+MAX_MISSED_COUNT = 10_000
+# What a run receives as the time its fire was scheduled for: the Liquid variable
+# in a prompt, this environment variable for a command or a producer.
+SCHEDULED_AT_ENV = "COTF_SCHEDULED_AT"
 
 LOG_DIR = DATA_DIR / "logs"
 DEFAULT_CONFIG = DATA_DIR / "cron.yaml"
@@ -139,6 +150,10 @@ EXAMPLE_YAML = """\
 #                    0 disables
 #   profile          name of an `agent.profiles` entry in config.yaml, to run
 #                    THIS entry on its own backend/model/effort. Needs a prompt.
+#   catch_up         a window like 30m, 2h or 1d. On start, an entry that missed
+#                    fires while the daemon was stopped fires ONCE, for the latest
+#                    missed time, if that time is inside the window. Missed fires
+#                    are logged and alerted either way. Not allowed with 'at'.
 #   min_tool_calls   fewest tool calls a fire must make to count as a success;
 #                    default 0, meaning no floor. A run below it is recorded
 #                    FAILED and alerts, which is how an agent that refused or
@@ -156,6 +171,10 @@ EXAMPLE_YAML = """\
 # with a warning rather than silently rendering a hole. Give optional fields a
 # default in jq: `priority: (.fields.priority.name // "none")`. A plain entry has
 # no `item`, and referencing one is rejected when this file loads.
+#
+# Every fire also gets `scheduled_at`, the local time it was scheduled for
+# (2026-10-28T18:00:00). A catch-up fire carries the missed time, not the restart
+# time. A command or producer gets the same value as $COTF_SCHEDULED_AT.
 #
 # Examples (uncomment and edit - a live entry starts firing immediately):
 #
@@ -205,6 +224,8 @@ class CronEntry:
     profile: str | None = None
     producer_timeout: int = PRODUCER_TIMEOUT_S
     min_tool_calls: int = 0
+    # Seconds: how old the latest missed fire may be and still run on start.
+    catch_up: float | None = None
 
     @property
     def kind(self) -> Literal["prompt", "producer", "command"]:
@@ -321,6 +342,7 @@ ENTRY_KEYS = frozenset(
         "max_fires",
         "profile",
         "min_tool_calls",
+        "catch_up",
     }
 )
 
@@ -451,6 +473,8 @@ def _validate_entry(
             "bare command runs no agent"
         )
 
+    catch_up = _catch_up_window(data, at is not None, where)
+
     entry = CronEntry(
         name=name,
         cron=cron_expr,
@@ -464,9 +488,61 @@ def _validate_entry(
         profile=profile,
         producer_timeout=producer_timeout,
         min_tool_calls=min_tool_calls,
+        catch_up=catch_up,
     )
     _validate_template(entry, where)
     return entry
+
+
+def _catch_up_window(
+    data: dict[str, object], one_shot: bool, where: str
+) -> float | None:
+    """The entry's `catch_up` window in seconds, or None when it has none.
+
+    The same `<n><unit>` grammar as a relative `at`. A one-shot entry is refused:
+    it already fires late after a restart, until the key-state store records it.
+    """
+    raw = data.get("catch_up")
+    if raw is None:
+        return None
+    if one_shot:
+        raise ValueError(
+            f"{where}: 'catch_up' needs 'cron'; an 'at' entry fires late anyway"
+        )
+    match = (
+        re.fullmatch(r"(\d+)\s*([smhd])", raw.strip()) if isinstance(raw, str) else None
+    )
+    if match is None or int(match.group(1)) == 0:
+        raise ValueError(
+            f"{where}: 'catch_up' must be a window like 30m, 2h or 1d, got {raw!r}"
+        )
+    return (
+        int(match.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    )
+
+
+def missed_fires(
+    cron_expr: str, after: datetime, now: datetime
+) -> tuple[int, datetime | None]:
+    """How many times `cron_expr` came due in (after, now], and the latest one.
+
+    The count stops at `MAX_MISSED_COUNT`; the latest is exact either way.
+    """
+    # A second past `now`, because `get_prev` is strict and a fire due at exactly
+    # `now` is missed too: the restart schedules the next one strictly after it.
+    latest = croniter(cron_expr, now + timedelta(seconds=1)).get_prev(datetime)
+    if latest <= after:
+        return 0, None
+    schedule = croniter(cron_expr, after)
+    count = 0
+    while count < MAX_MISSED_COUNT and schedule.get_next(datetime) <= now:
+        count += 1
+    return count, latest
+
+
+def _stamp(moment: datetime) -> str:
+    """A scheduled time as runs receive it: naive local ISO, to the second."""
+    return moment.replace(microsecond=0).isoformat()
 
 
 def _validate_template(entry: CronEntry, where: str) -> None:
@@ -489,7 +565,7 @@ def _validate_template(entry: CronEntry, where: str) -> None:
         raise ValueError(f"{where}: prompt template does not compile: {exc}") from exc
     if entry.kind == "prompt":
         try:
-            template.render()
+            template.render(scheduled_at="")
         except LiquidError as exc:
             raise ValueError(
                 f"{where}: prompt uses a variable this entry cannot supply "
@@ -779,6 +855,11 @@ def request_run_now(entry_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _with_scheduled_at(scheduled_at: str) -> dict[str, str]:
+    """This process's environment plus the fire's scheduled time."""
+    return {**os.environ, SCHEDULED_AT_ENV: scheduled_at}
+
+
 class CronDaemon:
     """Fires due entries and enqueues the work they produce."""
 
@@ -857,6 +938,7 @@ class CronDaemon:
     async def run(self) -> None:
         self.reload()
         self._print_summary()
+        await self._catch_up_missed(datetime.now())
         while not self._stop.is_set():
             await self._sleep_to_next_minute()
             if self._stop.is_set():
@@ -874,13 +956,15 @@ class CronDaemon:
                     state.next_fire = _NEVER_FIRE
                     if self._at_spent(state.entry):
                         continue
-                    await self._fire(state.entry)
+                    await self._fire(state.entry, state.entry.at)
                     self._key_state.record_fire(state.entry.name, _ONE_SHOT_FINGERPRINT)
                 else:
                     # Validation guarantees a cron expression when 'at' is absent.
                     assert state.entry.cron is not None
+                    scheduled = state.next_fire
                     state.next_fire = next_fire(state.entry.cron, now)
-                    await self._fire(state.entry)
+                    self._record_schedule(state.entry, scheduled)
+                    await self._fire(state.entry, scheduled)
 
     def _running_command_names(self) -> list[str]:
         """Entry names of the commands running right now."""
@@ -990,7 +1074,8 @@ class CronDaemon:
                 logger.warning("cron: run-now for unknown entry %r", name)
                 continue
             logger.info("cron: run-now firing %s", name)
-            await self._fire(state.entry)
+            # A run-now has no schedule of its own; it is due the moment it asks.
+            await self._fire(state.entry, datetime.now())
 
     def _at_spent(self, entry: CronEntry) -> bool:
         """Whether this one-shot entry already fired, per the key-state store.
@@ -1008,9 +1093,92 @@ class CronDaemon:
             return True
         return False
 
+    # --- missed fires ---
+
+    def _schedule_key(self, entry: CronEntry) -> str:
+        return f"{entry.name}/{_SCHEDULE_ITEM}"
+
+    def _record_schedule(self, entry: CronEntry, scheduled: datetime) -> None:
+        """Keep the time this fire was scheduled for, with the expression it came from.
+
+        Read on the next start to find the fires an outage swallowed. The
+        expression is kept so an edited schedule never counts the old one's
+        occurrences as missed.
+        """
+        try:
+            state = self._key_state.load(self._schedule_key(entry))
+            state.extras = {"scheduled_at": _stamp(scheduled), "cron": entry.cron}
+            self._key_state.save(self._schedule_key(entry), state)
+        except OSError:
+            logger.exception("cron %s: could not record its scheduled fire", entry.name)
+
+    def _last_scheduled(self, entry: CronEntry) -> datetime | None:
+        """The last recorded fire of this entry's current expression, or None."""
+        extras = self._key_state.load(self._schedule_key(entry)).extras
+        if extras.get("cron") != entry.cron:
+            return None
+        try:
+            return datetime.fromisoformat(str(extras.get("scheduled_at")))
+        except ValueError:
+            return None
+
+    async def _catch_up_missed(self, now: datetime) -> None:
+        """Report the fires that fell inside the outage, and catch up the opted-in.
+
+        Before this, a restart scheduled each entry from now, and everything due
+        while the daemon was down vanished without a line in any log. Now each
+        such entry logs one line and the whole start sends one alert. An entry
+        with `catch_up` whose latest miss is inside that window fires once, for
+        that latest miss only: a daily report run three times proves nothing.
+
+        An entry with no usable record (new, first start after this change, or a
+        changed expression) records now and replays nothing.
+        """
+        lines: list[str] = []
+        for state in list(self._state.values()):
+            entry = state.entry
+            if entry.cron is None:
+                continue
+            last = self._last_scheduled(entry)
+            if last is None:
+                self._record_schedule(entry, now)
+                continue
+            count, latest = missed_fires(entry.cron, last, now)
+            if latest is None:
+                continue
+            shown = f"{count}" if count < MAX_MISSED_COUNT else f"{count}+"
+            logger.warning(
+                "cron: missed %s x%s (last %s)", entry.name, shown, _stamp(latest)
+            )
+            line = f"{entry.name} x{shown} (last {_stamp(latest)})"
+            if entry.catch_up is not None and now - latest <= timedelta(
+                seconds=entry.catch_up
+            ):
+                logger.info("cron: catching up %s for %s", entry.name, _stamp(latest))
+                line += ", caught up once"
+                self._record_schedule(entry, latest)
+                await self._fire(entry, latest)
+            else:
+                self._record_schedule(entry, now)
+            lines.append(line)
+        if lines:
+            await self._alert_missed(lines)
+
+    async def _alert_missed(self, lines: list[str]) -> None:
+        """One alert for every entry this start found missed. Guarded like the rest."""
+        if self._alert_sink is None:
+            return
+        text = "missed scheduled fires while stopped:\n" + "\n".join(lines)
+        try:
+            await self._alert_sink.alert(
+                {"kind": "daemon", "entry": "claude-cron"}, Result(ok=False, text=text)
+            )
+        except Exception:
+            logger.exception("cron: could not alert the missed fires")
+
     # --- firing ---
 
-    async def _fire(self, entry: CronEntry) -> None:
+    async def _fire(self, entry: CronEntry, scheduled: datetime) -> None:
         """Start an entry's work and return. No kind of entry blocks the caller.
 
         The scheduling loop awaits this once per due entry, so anything slow here
@@ -1019,19 +1187,20 @@ class CronDaemon:
         other entries due at `:00` 38s late.
         """
         logger.info("cron: firing %s (%s)", entry.name, entry.kind)
+        stamp = _stamp(scheduled)
         try:
             if entry.kind == "command":
-                self._spawn_command(entry)
+                self._spawn_command(entry, stamp)
             elif entry.kind == "prompt":
-                self._enqueue_plain(entry)
+                self._enqueue_plain(entry, stamp)
             else:
-                self._spawn_producer(entry)
+                self._spawn_producer(entry, stamp)
         except Exception:
             # One broken entry must not take the daemon down; the next fire of
             # every other entry is still due.
             logger.exception("cron %s: fire failed", entry.name)
 
-    def _enqueue_plain(self, entry: CronEntry) -> None:
+    def _enqueue_plain(self, entry: CronEntry, scheduled_at: str) -> None:
         """One job per fire, keyed to the entry so two cannot overlap."""
         key = entry.name
         if self._queue.count_unfinished(entry.name) > 0:
@@ -1041,7 +1210,9 @@ class CronDaemon:
             )
             return
         try:
-            prompt = _LIQUID_ENV.from_string(entry.prompt_source()).render()
+            prompt = _LIQUID_ENV.from_string(entry.prompt_source()).render(
+                scheduled_at=scheduled_at
+            )
         except (OSError, LiquidError) as exc:
             logger.error("cron %s: cannot render prompt: %s", entry.name, exc)
             return
@@ -1050,10 +1221,13 @@ class CronDaemon:
         # what it meant before keys existed and what a daily digest wants.
         self._enqueue(entry, key=key, session_key=None, prompt=prompt)
 
-    async def _fire_producer(self, entry: CronEntry) -> None:
+    async def _fire_producer(self, entry: CronEntry, scheduled_at: str) -> None:
         assert entry.command is not None
         stdout, rc = await self._run_command(
-            entry.command, timeout=entry.producer_timeout, capture=True
+            entry.command,
+            timeout=entry.producer_timeout,
+            capture=True,
+            scheduled_at=scheduled_at,
         )
         if rc != 0:
             logger.error(
@@ -1068,9 +1242,11 @@ class CronDaemon:
         if not items:
             logger.debug("cron %s: producer emitted no items", entry.name)
             return
-        self._admit(entry, items)
+        self._admit(entry, items, scheduled_at)
 
-    def _admit(self, entry: CronEntry, items: Iterable[dict[str, Any]]) -> None:
+    def _admit(
+        self, entry: CronEntry, items: Iterable[dict[str, Any]], scheduled_at: str
+    ) -> None:
         """Enqueue what this entry is allowed to take on right now.
 
         Three gates, cheapest first: already queued, over the entry's cap, or held
@@ -1107,7 +1283,7 @@ class CronDaemon:
                 continue
 
             try:
-                prompt = template.render(item=item)
+                prompt = template.render(item=item, scheduled_at=scheduled_at)
             except LiquidError as exc:
                 render_failures += 1
                 logger.warning(
@@ -1185,7 +1361,7 @@ class CronDaemon:
         except Exception:
             logger.exception("cron %s: fire failed", entry.name)
 
-    def _spawn_producer(self, entry: CronEntry) -> None:
+    def _spawn_producer(self, entry: CronEntry, scheduled_at: str) -> None:
         """Run the producer off the loop, one at a time per entry.
 
         Two overlapping runs of the same poll would emit the same work list
@@ -1202,21 +1378,28 @@ class CronDaemon:
                 entry.name,
             )
             return
-        self._spawn(entry, self._fire_producer)
+        self._spawn(
+            entry, functools.partial(self._fire_producer, scheduled_at=scheduled_at)
+        )
 
     # --- side-effect commands ---
 
-    def _spawn_command(self, entry: CronEntry) -> None:
-        self._spawn(entry, self._run_side_effect)
+    def _spawn_command(self, entry: CronEntry, scheduled_at: str) -> None:
+        self._spawn(
+            entry, functools.partial(self._run_side_effect, scheduled_at=scheduled_at)
+        )
 
-    async def _run_side_effect(self, entry: CronEntry) -> None:
+    async def _run_side_effect(self, entry: CronEntry, scheduled_at: str) -> None:
         assert entry.command is not None
         started = datetime.now()
         _log_header(entry.name, "command", f"$ {entry.command}")
         try:
             with log_path(entry.name).open("a", encoding="utf-8") as handle:
                 proc = await asyncio.create_subprocess_shell(
-                    entry.command, stdout=handle, stderr=asyncio.subprocess.STDOUT
+                    entry.command,
+                    stdout=handle,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=_with_scheduled_at(scheduled_at),
                 )
                 try:
                     rc = await asyncio.wait_for(proc.wait(), timeout=entry.timeout)
@@ -1257,12 +1440,15 @@ class CronDaemon:
             logger.exception("cron %s: could not alert its failure", entry.name)
 
     async def _run_command(
-        self, command: str, *, timeout: float, capture: bool
+        self, command: str, *, timeout: float, capture: bool, scheduled_at: str
     ) -> tuple[str, int | None]:
         """Run a shell command, optionally capturing stdout. Returns (stdout, rc)."""
         pipe = asyncio.subprocess.PIPE if capture else None
         proc = await asyncio.create_subprocess_shell(
-            command, stdout=pipe, stderr=asyncio.subprocess.PIPE
+            command,
+            stdout=pipe,
+            stderr=asyncio.subprocess.PIPE,
+            env=_with_scheduled_at(scheduled_at),
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -1377,7 +1563,10 @@ def main() -> int:
         config_path=config,
         queue=queue,
         key_state=KeyStateStore(DATA_DIR / "jobs"),
-        alert_sink=build_alert_sink(settings.environment()),
+        # Unfiltered: every alert this daemon sends is about its own schedule.
+        # The cron-origin filter is for the worker, which also runs chat jobs, and
+        # it dropped the missed-fires alert, whose origin is the daemon.
+        alert_sink=build_alert_sink(settings.environment(), cron_only=False),
     )
 
     async def _run() -> None:

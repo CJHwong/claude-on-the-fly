@@ -97,6 +97,25 @@ item whose emitted fields do not move will park.
 reading a `failures` count nothing increments — which is exactly how it shipped
 broken once, with unit tests passing because they called `record_outcome` directly.
 
+## Missed fires and `catch_up`
+
+A restart schedules each entry from now, so a fire due during an outage would vanish
+with no log line. Each scheduled fire of a `cron` entry is therefore recorded under
+the key `<entry>/@schedule`, with the expression it came from. It is a separate key,
+not the entry's own one: the job worker writes the entry's key on every outcome from
+another process, and two writers of one file lose updates.
+
+`_catch_up_missed` runs once in `run`, after the first `reload`, not on later
+reloads. For each entry it counts the occurrences between the record and now, logs
+one line per entry, and sends one alert for the whole start. An entry with `catch_up`
+fires once for its latest miss when that miss is inside the window. A missing record,
+an unreadable one, or one written for a different expression records now and replays
+nothing. The count stops at `MAX_MISSED_COUNT`; the latest occurrence stays exact.
+
+Every fire passes its scheduled time to the run: `scheduled_at` in the template, and
+`COTF_SCHEDULED_AT` in a command's or producer's environment. A prompt job carries no
+environment into the worker, so for a prompt the template is the only route.
+
 ## Template rendering is strict
 
 `StrictUndefined`, deliberately. Lenient rendering would put a silent hole in a
@@ -105,7 +124,7 @@ split by blast radius: every item failing is a config bug (ERROR once, skip the
 fire), some items failing is data variance (WARNING per item, run the rest).
 
 Templates are compiled at config load, and a *plain* entry is additionally
-dry-rendered against an empty context — that is what catches an entry referencing
+dry-rendered against a context holding only `scheduled_at` — that is what catches an entry referencing
 `item` with no producer to supply one.
 
 ## Adding a config field
@@ -183,6 +202,10 @@ uses, so one platform sender is written once and shared. The alert is a
 heads-up, not a delivery: it is guarded, and the entry's log has the full
 story either way. Agent-run job failures alert from the worker instead; see
 [jobs.md](jobs.md).
+
+The daemon builds its sink with `cron_only=False`. The cron-origin filter is for the
+worker, which also runs chat jobs. Behind it, the missed-fires alert, whose origin is
+`kind: daemon`, was dropped without a log line.
 
 ## Timeouts
 
