@@ -126,10 +126,30 @@ async def test_failed_slack_source_does_not_shift_later_suppression_flags():
     front._pending_reply_suppressed = {LARGE_CHAT: deque([True, False])}
     front._in_flight = {}
     front.notify_complete = AsyncMock()
+    front._unreact = AsyncMock()
     await front.retire_failed_turn(LARGE_CHAT, {"channel": "D1", "message_ts": "101.0"})
     assert list(front._pending_msg[LARGE_CHAT]) == [("D1", "102.0")]
     assert list(front._pending_reply_suppressed[LARGE_CHAT]) == [False]
     front.notify_complete.assert_not_awaited()
+
+
+async def test_retiring_a_waiting_source_removes_its_waiting_marks():
+    from claude_on_the_fly.slack import (
+        INTERRUPTED_EMOJI,
+        QUEUED_EMOJI,
+        SlackFrontend,
+    )
+
+    front = object.__new__(SlackFrontend)
+    front._pending_msg = {LARGE_CHAT: deque([("D1", "101.0")])}
+    front._pending_reply_suppressed = {}
+    front._in_flight = {}
+    front._unreact = AsyncMock()
+    await front.retire_failed_turn(LARGE_CHAT, {"channel": "D1", "message_ts": "101.0"})
+    assert [c.args for c in front._unreact.await_args_list] == [
+        ("D1", "101.0", QUEUED_EMOJI),
+        ("D1", "101.0", INTERRUPTED_EMOJI),
+    ]
 
 
 async def test_retiring_in_flight_source_cleans_only_its_own_marker():

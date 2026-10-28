@@ -109,6 +109,10 @@ async def test_selection_error_reports_without_dispatch(
     await instance._process(1, Turn("question"))
     run.assert_not_called()
     assert "Account selection failed" in frontend.sent[0][1].body
+    # The message still leaves the queue and loses its marker. Otherwise the next
+    # turn's start takes this message's place and reacts on the wrong one.
+    assert frontend.start_notifications == [1]
+    assert frontend.complete_notifications == [1]
 
 
 def test_slack_subjects_use_channel_and_initiating_user():

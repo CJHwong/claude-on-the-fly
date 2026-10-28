@@ -4160,6 +4160,10 @@ class SlackFrontend(Frontend):
                     del suppressed[index]
         if self._in_flight.get(chat_id) == target:
             await self.notify_complete(chat_id)
+            return
+        # A retired message never starts, so nothing else clears its waiting marks.
+        await self._unreact(channel, message_ts, QUEUED_EMOJI)
+        await self._unreact(channel, message_ts, INTERRUPTED_EMOJI)
 
     async def notify_interrupted(
         self, chat_id: int, *, running: bool, queued: int
