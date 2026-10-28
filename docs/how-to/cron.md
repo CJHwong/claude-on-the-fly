@@ -137,6 +137,23 @@ reply under that alert instead of posting a new one. Unset, failures stay
 in the entry's log as they always did. Both settings need a restart of
 `claude-jobs` and `claude-cron`.
 
+## Catching up after a stop
+
+When `claude-cron` starts, it logs and alerts every fire it missed while it was
+stopped. To also run an entry once after a stop, give it a window:
+
+```yaml
+  - name: release-notes
+    cron: "0 18 * * 1-5"
+    catch_up: 6h
+    command: ./discover.py --now "$COTF_SCHEDULED_AT"
+```
+
+If the daemon was down at 18:00 and starts again before midnight, the entry fires
+once, with `COTF_SCHEDULED_AT` set to the 18:00 time. A prompt reads the same value as
+`{{ scheduled_at }}`. Use it in any entry that checks the clock, so a late run still
+does the missed run's work.
+
 ## Checking your config
 
 ```bash

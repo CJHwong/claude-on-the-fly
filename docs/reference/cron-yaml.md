@@ -26,6 +26,7 @@ entries:
 | `max_fires` | integer / `3` | Unchanged fires before parking; `0` disables parking |
 | `profile` | string / unset | Names an `agent.profiles` block in `config.yaml`; needs a prompt, since a bare command runs no agent |
 | `min_tool_calls` | integer / `0` | Fewest tool calls a fire must make to count as a success; `0` is no floor. Needs a prompt, since a bare command runs no agent |
+| `catch_up` | string / unset | A window: `30m`, `2h`, `1d`. On start, if the entry's latest missed fire is inside the window, it fires once for that time. Needs `cron`, not `at` |
 
 Every entry needs a prompt, prompt file, or command. A producer command writes one JSON
 object per line with a non-empty `key`.
@@ -44,6 +45,33 @@ raises nothing, so an agent that refused, or replied without acting, is recorded
 success and alerts nobody. Set the floor and a run below it is recorded `FAILED` and
 alerts on the ordinary failure path. Leave it unset on an entry that legitimately has
 nothing to do on some fires, or every such fire alerts.
+
+## Missed fires
+
+The daemon records each scheduled fire of a `cron` entry. On start it counts the fires
+that came due while it was stopped:
+
+1. Each entry that missed fires logs `cron: missed <name> xN (last <time>)`.
+2. The start sends one alert to the configured alert channel. The alert lists every
+   entry that missed fires.
+3. If the entry has `catch_up` and its latest miss is inside that window, the entry
+   fires once, for the latest missed time only. An entry that missed several fires
+   still runs once.
+
+An entry with no record yet (new, or first start after an upgrade) starts its record
+then and replays nothing. A changed `cron` expression also starts a new record, so the
+old schedule's times never count as missed. Fires missed while the daemon runs are not
+caught up here; a late wake-up already fires them.
+
+## Scheduled time
+
+Every fire carries the local time it was scheduled for, as `2026-10-28T18:00:00`:
+
+- A prompt reads it as `{{ scheduled_at }}`.
+- A command or producer command reads it as `$COTF_SCHEDULED_AT`.
+
+A catch-up fire carries the missed time, not the restart time. A run-now fire carries
+the time of the request.
 
 An unknown `profile` fails at load, so a typo is caught when you save the file rather
 than on the entry's next fire. Changing a profile's model changes the session identity,

@@ -83,6 +83,26 @@ class TestCronMain:
         assert cron_mod.main() == 0
         assert ran == ["ran"]
 
+    def test_its_alerts_are_not_filtered_to_cron_origin(
+        self, tmp_path, monkeypatch, no_dotenv, no_daemon_logging
+    ):
+        """The cron-origin filter is for the job worker, which also runs chat jobs.
+        Behind it, the start's missed-fires alert (a daemon origin) was dropped."""
+        config = self._config(tmp_path)
+        monkeypatch.setattr("sys.argv", ["claude-cron", "--config", str(config)])
+        from claude_on_the_fly.jobs import alerts, registry
+
+        monkeypatch.setattr(registry, "make_queue", lambda: MagicMock())
+        built: list[dict] = []
+
+        def fake_build(env, **kwargs):
+            built.append(kwargs)
+
+        monkeypatch.setattr(alerts, "build_alert_sink", fake_build)
+        monkeypatch.setattr(cron_mod.asyncio, "run", lambda coro: coro.close())
+        assert cron_mod.main() == 0
+        assert built == [{"cron_only": False}]
+
     def test_a_keyboard_interrupt_is_a_clean_exit(
         self, tmp_path, monkeypatch, no_dotenv, no_daemon_logging
     ):
