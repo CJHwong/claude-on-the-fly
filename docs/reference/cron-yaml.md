@@ -65,7 +65,7 @@ caught up here; a late wake-up already fires them.
 
 ## Scheduled time
 
-Every fire carries the local time it was scheduled for, as `2026-10-28T18:00:00`:
+Every fire carries the local time it was scheduled for, with its offset, as `2026-10-28T18:00:00+08:00`:
 
 - A prompt reads it as `{{ scheduled_at }}`.
 - A command or producer command reads it as `$COTF_SCHEDULED_AT`.

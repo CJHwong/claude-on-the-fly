@@ -115,6 +115,9 @@ nothing. The count stops at `MAX_MISSED_COUNT`; the latest occurrence stays exac
 Every fire passes its scheduled time to the run: `scheduled_at` in the template, and
 `COTF_SCHEDULED_AT` in a command's or producer's environment. A prompt job carries no
 environment into the worker, so for a prompt the template is the only route.
+The run gets the local offset (`_run_stamp`), because a strict parser refuses a naive
+time. The schedule record and the log keep naive local time (`_stamp`): the record is
+compared with the daemon's naive clock, and an offset there would break that.
 
 ## Template rendering is strict
 

@@ -173,7 +173,7 @@ EXAMPLE_YAML = """\
 # no `item`, and referencing one is rejected when this file loads.
 #
 # Every fire also gets `scheduled_at`, the local time it was scheduled for
-# (2026-10-28T18:00:00). A catch-up fire carries the missed time, not the restart
+# (2026-10-28T18:00:00+08:00). A catch-up fire carries the missed time, not the restart
 # time. A command or producer gets the same value as $COTF_SCHEDULED_AT.
 #
 # Examples (uncomment and edit - a live entry starts firing immediately):
@@ -541,8 +541,17 @@ def missed_fires(
 
 
 def _stamp(moment: datetime) -> str:
-    """A scheduled time as runs receive it: naive local ISO, to the second."""
+    """A scheduled time as the daemon keeps and logs it: naive local ISO, to the second."""
     return moment.replace(microsecond=0).isoformat()
+
+
+def _run_stamp(moment: datetime) -> str:
+    """A scheduled time as runs receive it: local ISO with its offset, to the second.
+
+    A consumer that parses the value strictly refuses a time with no offset, and
+    a script cannot know which zone the daemon ran in.
+    """
+    return moment.astimezone().replace(microsecond=0).isoformat()
 
 
 def _validate_template(entry: CronEntry, where: str) -> None:
@@ -1187,7 +1196,7 @@ class CronDaemon:
         other entries due at `:00` 38s late.
         """
         logger.info("cron: firing %s (%s)", entry.name, entry.kind)
-        stamp = _stamp(scheduled)
+        stamp = _run_stamp(scheduled)
         try:
             if entry.kind == "command":
                 self._spawn_command(entry, stamp)
