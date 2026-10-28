@@ -1698,6 +1698,58 @@ class TestSendProgress:
         assert list(frontend._our_sent_timestamps) == []
 
 
+class TestEndProgress:
+    async def test_the_timeline_is_left_alone_by_default(self, frontend):
+        session_id = _seed_progress_route(frontend)
+        await frontend.send_progress(session_id, "working")
+
+        await frontend.end_progress(session_id, succeeded=True)
+
+        frontend._app.client.chat_update.assert_not_awaited()
+        assert session_id not in frontend._progress_messages
+
+    @pytest.mark.parametrize(
+        ("succeeded", "label"), [(True, "✓ Completed"), (False, "■ Stopped")]
+    )
+    async def test_the_label_closes_the_newest_message(
+        self, frontend, monkeypatch, succeeded, label
+    ):
+        monkeypatch.setenv("SLACK_PROGRESS_END_LABEL", "true")
+        session_id = _seed_progress_route(frontend)
+        await frontend.send_progress(session_id, "working")
+
+        await frontend.end_progress(session_id, succeeded=succeeded)
+
+        kwargs = frontend._app.client.chat_update.call_args.kwargs
+        assert kwargs["ts"] == "99.0"
+        assert kwargs["text"].endswith(f"working\n{label}")
+        assert session_id not in frontend._progress_messages
+
+    async def test_a_full_message_gets_no_label(self, frontend, monkeypatch):
+        monkeypatch.setenv("SLACK_PROGRESS_END_LABEL", "true")
+        session_id = _seed_progress_route(frontend)
+        frontend._progress_messages[session_id] = [("C1", "99.0", "x" * 100_000)]
+
+        await frontend.end_progress(session_id, succeeded=True)
+
+        frontend._app.client.chat_update.assert_not_awaited()
+
+    async def test_a_failed_edit_is_logged_not_raised(
+        self, frontend, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("SLACK_PROGRESS_END_LABEL", "true")
+        session_id = _seed_progress_route(frontend)
+        await frontend.send_progress(session_id, "working")
+        frontend._app.client.chat_update = AsyncMock(
+            side_effect=SlackApiError("nope", {"ok": False, "error": "msg_too_long"})
+        )
+
+        with caplog.at_level("WARNING", logger="claude_on_the_fly.slack"):
+            await frontend.end_progress(session_id, succeeded=True)
+
+        assert "could not label" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # _resolve_sender
 # ---------------------------------------------------------------------------

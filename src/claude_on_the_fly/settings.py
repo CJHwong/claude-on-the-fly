@@ -160,6 +160,7 @@ FIELDS: dict[str, Field] = {
     "slack.job_command": Field("SLACK_JOB_COMMAND"),
     "slack.alert_target": Field("SLACK_ALERT_TARGET"),
     "slack.startup_canary": Field("SLACK_STARTUP_CANARY"),
+    "slack.progress_end_label": Field("SLACK_PROGRESS_END_LABEL"),
     "slack.session_cap": Field("SLACK_SESSION_CAP"),
     "slack.reply_soft_limit": Field("SLACK_REPLY_SOFT_LIMIT"),
     "slack.reply_limit_notice_seconds": Field("SLACK_REPLY_LIMIT_NOTICE_SECONDS"),

@@ -1053,6 +1053,19 @@ class Orchestrator:
             logger.exception("settings: could not report the restart-required change")
 
     async def _process(self, chat_id: int, turn: Turn) -> None:
+        # The status spans account setup too. A setup failure that skipped the
+        # start left this message in the frontend's queue, and the next turn's
+        # start then marked the wrong message. A stop can land while the start
+        # waits on Slack, so the start sits inside the `try` as well.
+        try:
+            if not turn.background:
+                await self._frontend.notify_start(chat_id)
+            await self._process_with_account(chat_id, turn)
+        finally:
+            if not turn.background:
+                await self._frontend.notify_complete(chat_id)
+
+    async def _process_with_account(self, chat_id: int, turn: Turn) -> None:
         from claude_on_the_fly import accounts
 
         try:
@@ -1209,7 +1222,6 @@ class Orchestrator:
             if session_overrides:
                 env_token = sandbox.session_env(session_overrides)
             if not turn.background:
-                await self._frontend.notify_start(chat_id)
                 typing_task = asyncio.create_task(self._typing_loop(chat_id))
             if turn.compact:
                 response = await self._run_compaction(
@@ -1426,8 +1438,6 @@ class Orchestrator:
                 self._commands.revoke_token(command_token)
             if turn.background:
                 self._background.discard(chat_id)
-            else:
-                await self._frontend.notify_complete(chat_id)
 
     def _start_interim(self, chat_id: int) -> InterimProgress | None:
         """This turn's progress relay, or None when nothing could come of one.
