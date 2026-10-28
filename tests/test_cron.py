@@ -37,7 +37,7 @@ def write_config(path: Path, entries: list[dict]) -> Path:
 
 # The scheduled time a test fire carries, and the same as a run receives it.
 WHEN = datetime(2026, 1, 1, 9, 0)
-STAMP = "2026-01-01T09:00:00"
+STAMP = "2026-01-01T09:00:00+08:00"
 
 
 def cfg(tmp_path: Path, *entries: dict) -> Path:
@@ -2565,7 +2565,8 @@ class TestMissedFires:
 
         await cron._catch_up_missed(datetime(2026, 1, 1, 14, 30))
 
-        assert [job.prompt for job in queue.jobs] == ["run for 2026-01-01T14:00:00"]
+        missed = datetime(2026, 1, 1, 14, 0).astimezone().isoformat()
+        assert [job.prompt for job in queue.jobs] == [f"run for {missed}"]
         assert cron._last_scheduled(cron._state["a"].entry) == datetime(
             2026, 1, 1, 14, 0
         )
@@ -2783,6 +2784,15 @@ class TestScheduledAt:
     def test_a_plain_prompt_using_it_loads(self, tmp_path: Path) -> None:
         entries = load_config(cfg(tmp_path, _hourly()))
         assert entries[0].prompt == "run for {{ scheduled_at }}"
+
+    async def test_a_fire_carries_the_local_offset(self, tmp_path: Path) -> None:
+        # A consumer that parses the value strictly refuses a time with no offset.
+        queue = FakeQueue()
+        cron = daemon(tmp_path, cfg(tmp_path, _hourly()), queue)
+        await cron._fire(load_config(cfg(tmp_path, _hourly()))[0], WHEN)
+        stamp = queue.jobs[0].prompt.removeprefix("run for ")
+        assert stamp == WHEN.astimezone().isoformat()
+        assert datetime.fromisoformat(stamp).utcoffset() is not None
 
 
 class TestCatchUpConfig:
