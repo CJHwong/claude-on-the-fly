@@ -141,6 +141,8 @@ DEFAULT_JOB_COMMAND = "$job"
 # well as the block: that is what a mobile push shows, and a context block is
 # styling, not a prefix.
 INTERIM_PREFIX = "⏳"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
 # Progress goes only where the audience asked for this turn. In a shared channel
 # there is no reply budget protecting bystanders from it (interim posts do not
 # increment one), so narration would land on people who never asked a question.
@@ -4109,8 +4111,28 @@ class SlackFrontend(Frontend):
         reached that reply — which tools ran, what was retried, where a long turn
         spent its time — and the reply says none of that. Deleting it would throw
         away the only record anybody outside the host can read.
+
+        With `slack.progress_end_label` on, the newest message also gets a last
+        line saying how the turn ended. Without it, a timeline whose last line is
+        "Running for" reads as a turn that is still running.
         """
-        self._progress_messages.pop(chat_id, None)
+        messages = self._progress_messages.pop(chat_id, None)
+        if not messages:
+            return
+        if settings.get("SLACK_PROGRESS_END_LABEL").strip().lower() not in _TRUTHY:
+            return
+        channel, ts, body = messages[-1]
+        label = "✓ Completed" if succeeded else "■ Stopped"
+        closed = f"{body}\n{label}"
+        if not _progress_fits(closed):
+            logger.info("progress: message is full, leaving %s without a label", ts)
+            return
+        try:
+            await self._app.client.chat_update(
+                channel=channel, ts=ts, text=closed, blocks=_progress_blocks(closed)
+            )
+        except Exception as exc:
+            logger.warning("progress: could not label %s: %s", ts, exc)
 
     def _record_upload_ts(self, resp: AsyncSlackResponse) -> None:
         """Record the ts of file-share messages we just posted so our own upload

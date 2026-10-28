@@ -679,6 +679,10 @@ slack:
   # Proves the agent CLI and its login work from this daemon. Costs one turn per start.
   # startup_canary: false
 
+  # Add a last line to a DM's progress timeline when the turn ends: "✓ Completed"
+  # or "■ Stopped". Off leaves the timeline as it was, ending on "Running for".
+  # progress_end_label: false
+
   # Threads retained before LRU eviction, turns per thread before the $continue gate;
   # seconds a gate notice is held (0 posts now), seconds a "tag me" notice waits (0 = never).
   # session_cap: 1000
