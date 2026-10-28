@@ -459,7 +459,8 @@ def frontend(monkeypatch):
         mock_app.client.users_info = AsyncMock()
         mock_app.client.conversations_info = AsyncMock()
         mock_app.client.conversations_members = AsyncMock()
-        mock_app.client.conversations_history = AsyncMock()
+        # Empty by default: a catch-up after an accepted message reads history.
+        mock_app.client.conversations_history = AsyncMock(return_value={"messages": []})
         mock_app_cls.return_value = mock_app
 
         fe = SlackFrontend(
@@ -1961,9 +1962,10 @@ class TestStart:
             mock_handler_cls.return_value = AsyncMock()
             await frontend.start(mock_on_message)
 
-        # The "message" event and "hello" event should have been registered
         frontend._app.event.assert_any_call({"type": "message"})
-        frontend._app.event.assert_any_call("hello")
+        # `hello` is a Socket Mode frame that Bolt never dispatches as an event;
+        # it is heard on the client instead (see test_a_socket_hello_runs_catch_up).
+        assert "hello" not in [c.args[0] for c in frontend._app.event.call_args_list]
 
 
 # ---------------------------------------------------------------------------
@@ -1972,12 +1974,13 @@ class TestStart:
 
 
 class TestOnHello:
-    async def test_initial_connection_no_catchup(self, frontend):
+    async def test_initial_connection_always_runs_catchup(self, frontend):
+        """Stored failed events need it even when no watermark was restored."""
         frontend._connected_once = False
         with patch.object(frontend, "_catchup", new_callable=AsyncMock) as mock_catchup:
             await frontend._on_hello(event={}, say=None)
         assert frontend._connected_once is True
-        mock_catchup.assert_not_awaited()
+        mock_catchup.assert_awaited_once()
 
     async def test_initial_connection_runs_catchup_from_durable_watermark(
         self, frontend
@@ -1996,10 +1999,9 @@ class TestOnHello:
         SlackWatermarks(slack_mod.DATA_DIR / "state" / "slack.watermarks.json").record(
             "D1", "100.0", "im"
         )
-        with patch.object(frontend, "_catchup", new_callable=AsyncMock) as catchup:
+        with patch.object(frontend, "_catchup", new_callable=AsyncMock):
             await frontend._on_hello(event={}, say=None)
 
-        catchup.assert_not_awaited()
         assert "D1" not in frontend._active_channels
 
     async def test_initial_catchup_ingests_only_the_unseen_history(self, frontend):
@@ -2028,7 +2030,10 @@ class TestOnHello:
         assert "sent during restart" in frontend._on_message.await_args.args[1]
         assert missed_ts in frontend._processed_ts
         frontend._app.client.conversations_history.assert_awaited_once_with(
-            channel="D1", oldest=previous_ts, inclusive=False, limit=20
+            channel="D1",
+            oldest=previous_ts,
+            inclusive=False,
+            limit=slack_mod.CATCHUP_PAGE_SIZE,
         )
 
     async def test_reconnection_triggers_catchup(self, frontend):
@@ -2044,6 +2049,11 @@ class TestOnHello:
 
 
 class TestCatchup:
+    @pytest.fixture(autouse=True)
+    def _no_age_limit(self, monkeypatch):
+        """These use small literal timestamps. The window has its own test."""
+        monkeypatch.setattr(slack_mod, "DEFAULT_MAX_AGE_SECONDS", float("inf"))
+
     async def test_empty_active_channels_returns_early(self, frontend):
         frontend._active_channels = {}
         await frontend._catchup()
@@ -3652,6 +3662,25 @@ class TestStartGatesOnToken:
         bot_frontend._register_app_interactions.assert_called_once()
         if bot_frontend._warm_task:
             await bot_frontend._warm_task
+
+    async def test_a_socket_hello_runs_catch_up(self, frontend):
+        """Socket Mode's `hello` is a connection frame, not an Events API event,
+        so Bolt never dispatches it to `app.event("hello")`. Catch-up hung off
+        that registration and never ran, on a start or on a reconnect."""
+        frontend._on_hello = AsyncMock()
+        with patch("claude_on_the_fly.slack.AsyncSocketModeHandler") as handler_cls:
+            handler_cls.return_value.start_async = AsyncMock()
+            client = handler_cls.return_value.client
+            client.message_listeners = []
+            await frontend.start(AsyncMock())
+
+        assert len(client.message_listeners) == 1
+        listener = client.message_listeners[0]
+        await listener(client, {"type": "events_api", "envelope_id": "e1"}, "")
+        assert frontend._hello_task is None
+        await listener(client, {"type": "hello"}, "")
+        await frontend._hello_task
+        frontend._on_hello.assert_awaited_once()
 
     async def test_user_token_skips_commands(self, frontend):
         frontend._register_app_interactions = MagicMock()
@@ -6361,9 +6390,9 @@ class TestWatermarkDurability:
         restored = SlackWatermarks(
             slack_mod.DATA_DIR / "state" / "slack.watermarks.json"
         ).recent()
-        assert [(row.channel, row.ts, row.channel_type) for row in restored] == [
-            ("D1", event_ts, "im")
-        ]
+        assert [
+            (row.channel, row.ts, row.channel_type, row.thread_ts) for row in restored
+        ] == [("D1", event_ts, "im", ""), ("D1", event_ts, "im", event_ts)]
 
     def test_the_store_is_reread_when_the_data_dir_moves(
         self, frontend, monkeypatch, tmp_path
@@ -7985,3 +8014,528 @@ class TestHandlerFailures:
             "Failed to run listener function "
             "(error: name 'event_origin' is not defined)" in caplog.text
         )
+
+
+# ---------------------------------------------------------------------------
+# Catch-up gaps: thread replies, paging, mark-at-hand-off, failed-event retry
+# ---------------------------------------------------------------------------
+
+
+def _watermark_file() -> Path:
+    return slack_mod.DATA_DIR / "state" / "slack.watermarks.json"
+
+
+def _failed_file() -> Path:
+    return slack_mod.DATA_DIR / "state" / "slack.failed_events.json"
+
+
+def _dm(ts: str, text: str = "hello", **extra) -> dict:
+    return {
+        "ts": ts,
+        "channel": "D1",
+        "channel_type": "im",
+        "user": "U_ALLOWED",
+        "text": text,
+        **extra,
+    }
+
+
+class TestCatchupThreads:
+    @pytest.fixture(autouse=True)
+    def _no_age_limit(self, monkeypatch):
+        """These use small literal timestamps. The window has its own test."""
+        monkeypatch.setattr(slack_mod, "DEFAULT_MAX_AGE_SECONDS", float("inf"))
+
+    async def test_a_thread_reply_records_a_thread_watermark(self, frontend):
+        root = str(time.time() - 10)
+        reply = str(time.time())
+        await frontend._ingest_event(_dm(reply, thread_ts=root))
+
+        # Only the thread moves. A live reply arriving while catch-up runs must
+        # not push the channel past a top-level message missed in the outage.
+        rows = SlackWatermarks(_watermark_file()).recent()
+        assert {(row.channel, row.thread_ts, row.ts) for row in rows} == {
+            ("D1", root, reply),
+        }
+        assert frontend._active_threads[("D1", root)] == reply
+        assert "D1" not in frontend._active_channels
+
+    async def test_a_root_message_records_its_thread_watermark(self, frontend):
+        """COTF answers a root in a thread, so the sender's next reply lands
+        there. Without the root's entry, a reply sent while the daemon is down
+        is never fetched."""
+        root = str(time.time())
+        await frontend._ingest_event(_dm(root))
+
+        assert frontend._active_threads == {("D1", root): root}
+        assert [row.thread_ts for row in frontend._watermarks.recent()] == ["", root]
+
+    async def test_a_thread_reply_missed_during_downtime_is_ingested(self, frontend):
+        root = str(time.time() - 60)
+        seen = str(time.time() - 30)
+        missed = str(time.time() - 5)
+        SlackWatermarks(_watermark_file()).record("D1", seen, "im", thread_ts=root)
+        frontend._app.client.conversations_history.return_value = {"messages": []}
+        frontend._app.client.conversations_replies = AsyncMock(
+            return_value={
+                "messages": [
+                    {
+                        "ts": root,
+                        "thread_ts": root,
+                        "user": "U_ALLOWED",
+                        "text": "root",
+                    },
+                    {
+                        "ts": missed,
+                        "thread_ts": root,
+                        "user": "U_ALLOWED",
+                        "text": "reply sent while down",
+                    },
+                ]
+            }
+        )
+
+        await frontend._on_hello(event={}, say=None)
+
+        # The first call is the catch-up read. A later one is the new session
+        # fetching its thread context, which is not what this test is about.
+        assert frontend._app.client.conversations_replies.await_args_list[
+            0
+        ].kwargs == dict(
+            channel="D1",
+            ts=root,
+            oldest=seen,
+            inclusive=False,
+            limit=slack_mod.CATCHUP_PAGE_SIZE,
+        )
+        frontend._on_message.assert_awaited_once()
+        assert "reply sent while down" in frontend._on_message.await_args.args[1]
+        assert root not in frontend._processed_ts
+
+    async def test_restore_merges_thread_entries_without_moving_back(self, frontend):
+        latest = str(time.time())
+        SlackWatermarks(_watermark_file()).record(
+            "D1", str(float(latest) - 10), "im", thread_ts="50.0"
+        )
+        frontend._active_threads[("D1", "50.0")] = latest
+
+        assert frontend._restore_watermarks() == 1
+        assert frontend._active_threads[("D1", "50.0")] == latest
+        assert frontend._channel_types["D1"] == "im"
+
+    async def test_a_five_hour_old_watermark_is_restored(self, frontend):
+        SlackWatermarks(_watermark_file()).record(
+            "D1", str(time.time() - 5 * 3600), "im"
+        )
+
+        assert frontend._restore_watermarks() == 1
+        assert "D1" in frontend._active_channels
+
+    async def test_a_replies_failure_continues_with_the_next_entry(self, frontend):
+        frontend._active_threads = {("C1", "50.0"): "100.0"}
+        frontend._active_channels = {"C2": "200.0"}
+        frontend._app.client.conversations_replies = AsyncMock(
+            side_effect=Exception("network")
+        )
+        frontend._app.client.conversations_history.return_value = {
+            "messages": [{"ts": "201.0", "text": "ok"}]
+        }
+        with patch.object(frontend, "_ingest_event", new_callable=AsyncMock) as ingest:
+            await frontend._catchup()
+
+        frontend._app.client.conversations_replies.assert_awaited_once()
+        assert [call.args[0]["ts"] for call in ingest.await_args_list] == ["201.0"]
+
+
+class TestCatchupPaging:
+    @pytest.fixture(autouse=True)
+    def _no_age_limit(self, monkeypatch):
+        """These use small literal timestamps. The window has its own test."""
+        monkeypatch.setattr(slack_mod, "DEFAULT_MAX_AGE_SECONDS", float("inf"))
+
+    async def test_25_new_messages_are_ingested_across_pages_oldest_first(
+        self, frontend
+    ):
+        frontend._active_channels = {"C1": "100.0"}
+        # Slack's history pages run newest first.
+        newest = [{"ts": f"{125 - i}.0", "text": f"m{125 - i}"} for i in range(25)]
+        frontend._app.client.conversations_history.side_effect = [
+            {
+                "messages": newest[:20],
+                "has_more": True,
+                "response_metadata": {"next_cursor": "page2"},
+            },
+            {"messages": newest[20:], "response_metadata": {"next_cursor": ""}},
+        ]
+        with patch.object(frontend, "_ingest_event", new_callable=AsyncMock) as ingest:
+            await frontend._catchup()
+
+        assert [call.args[0]["ts"] for call in ingest.await_args_list] == [
+            f"{101 + i}.0" for i in range(25)
+        ]
+        calls = frontend._app.client.conversations_history.await_args_list
+        assert calls[0].kwargs == {
+            "channel": "C1",
+            "oldest": "100.0",
+            "inclusive": False,
+            "limit": slack_mod.CATCHUP_PAGE_SIZE,
+        }
+        assert calls[1].kwargs["cursor"] == "page2"
+
+    async def test_the_total_cap_stops_and_warns(self, frontend, monkeypatch, caplog):
+        monkeypatch.setattr(slack_mod, "MAX_CATCHUP_MESSAGES", 3)
+        frontend._active_channels = {"C1": "100.0", "C2": "200.0"}
+        frontend._app.client.conversations_history.side_effect = [
+            {"messages": [{"ts": f"{100 + i}.5"} for i in range(5)]},
+            {"messages": [{"ts": "201.0"}]},
+        ]
+        with (
+            patch.object(frontend, "_ingest_event", new_callable=AsyncMock) as ingest,
+            caplog.at_level(logging.WARNING),
+        ):
+            await frontend._catchup()
+
+        assert [call.args[0]["ts"] for call in ingest.await_args_list] == [
+            "100.5",
+            "101.5",
+            "102.5",
+        ]
+        # The cap stops the scan, so the second conversation is not even read.
+        assert frontend._app.client.conversations_history.await_count == 1
+        assert "cap of 3" in caplog.text
+        assert "2 message(s) left" in caplog.text
+        assert "1 conversation(s) not scanned" in caplog.text
+
+    async def test_a_message_that_raises_does_not_stop_the_scan(self, frontend):
+        frontend._active_channels = {"C1": "100.0"}
+        frontend._app.client.conversations_history.return_value = {
+            "messages": [{"ts": "102.0"}, {"ts": "101.0"}]
+        }
+        with patch.object(
+            frontend,
+            "_ingest_event",
+            new_callable=AsyncMock,
+            side_effect=[RuntimeError("bug"), None],
+        ) as ingest:
+            await frontend._catchup()
+
+        assert ingest.await_count == 2
+
+
+class TestMarkProcessedAtHandOff:
+    async def test_a_failure_building_the_turn_leaves_it_unprocessed(self, frontend):
+        event = _dm(str(time.time()))
+        with (
+            patch.object(slack_mod, "sender_marker", side_effect=RuntimeError("bug")),
+            pytest.raises(RuntimeError),
+        ):
+            await frontend._ingest_event(dict(event))
+
+        assert event["ts"] not in frontend._processed_ts
+        assert len(frontend._watermarks) == 0
+
+
+class TestFailedEventRetry:
+    async def test_a_failure_before_hand_off_is_stored_and_replayed_once(
+        self, frontend
+    ):
+        event = _dm(str(time.time()), "lost to a bug")
+        with (
+            patch.object(frontend, "_identify_session", side_effect=RuntimeError),
+            pytest.raises(RuntimeError),
+        ):
+            await frontend._ingest_event(dict(event))
+        assert _failed_file().exists()
+        assert len(frontend._failed_events) == 1
+
+        await frontend._catchup()
+        await frontend._catchup()
+
+        frontend._on_message.assert_awaited_once()
+        assert "lost to a bug" in frontend._on_message.await_args.args[1]
+        assert len(frontend._failed_events) == 0
+
+    async def test_a_failure_after_hand_off_is_not_stored(self, frontend, caplog):
+        event = _dm(str(time.time()))
+        frontend._on_message.side_effect = RuntimeError("agent side")
+        with caplog.at_level(logging.INFO), pytest.raises(RuntimeError):
+            await frontend._ingest_event(dict(event))
+
+        assert len(frontend._failed_events) == 0
+        assert "already marked processed" in caplog.text
+
+    async def test_reconnects_during_an_outage_keep_it_for_the_fix(self, frontend):
+        """Each reconnect replays and fails again while the bug is live. The
+        restart that ships the fix must still find the event."""
+        event = _dm(str(time.time()), "sent during the outage")
+        with patch.object(frontend, "_identify_session", side_effect=RuntimeError):
+            with pytest.raises(RuntimeError):
+                await frontend._ingest_event(dict(event))
+            for _ in range(4):
+                await frontend._catchup()
+        assert len(frontend._failed_events) == 1
+
+        await frontend._catchup()
+
+        frontend._on_message.assert_awaited_once()
+        assert len(frontend._failed_events) == 0
+
+    async def test_initial_connection_without_watermarks_replays_failures(
+        self, frontend
+    ):
+        event = _dm(str(time.time()), "stored before restart")
+        with (
+            patch.object(frontend, "_identify_session", side_effect=RuntimeError),
+            pytest.raises(RuntimeError),
+        ):
+            await frontend._ingest_event(dict(event))
+        # A new process: nothing in memory, only the files.
+        frontend._failed_events_cache = None
+        frontend._processed_events_cache = None
+        frontend._connected_once = False
+        assert len(frontend._watermarks) == 0
+
+        await frontend._on_hello(event={}, say=None)
+
+        frontend._on_message.assert_awaited_once()
+        assert "stored before restart" in frontend._on_message.await_args.args[1]
+        assert len(frontend._failed_events) == 0
+
+    async def test_a_replay_that_fails_after_hand_off_is_cleared(self, frontend):
+        event = _dm(str(time.time()))
+        frontend._failed_events.record_failure(dict(event))
+        frontend._on_message.side_effect = RuntimeError("agent side")
+
+        await frontend._catchup()
+
+        assert len(frontend._failed_events) == 0
+
+    def test_the_store_is_reread_when_the_data_dir_moves(
+        self, frontend, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path / "one")
+        frontend._failed_events.record_failure(_dm(str(time.time())))
+        monkeypatch.setattr(slack_mod, "DATA_DIR", tmp_path / "two")
+
+        assert len(frontend._failed_events) == 0
+
+
+class TestCatchupReviewFixes:
+    async def test_skipped_messages_advance_the_position_past_the_cap(
+        self, frontend, monkeypatch
+    ):
+        """A busy channel whose messages are all skipped used to spend the cap
+        on the same messages every scan and never reach later conversations."""
+        monkeypatch.setattr(slack_mod, "MAX_CATCHUP_MESSAGES", 2)
+        base = time.time() - 60
+        start = str(base)
+        stamps = [str(base + i) for i in (1, 2, 3)]
+        frontend._active_channels = {"D1": start}
+        frontend._channel_types["D1"] = "im"
+        frontend._app.client.conversations_history.return_value = {
+            "messages": [
+                {"ts": ts, "user": "U_STRANGER", "text": "not for us"}
+                for ts in reversed(stamps)
+            ]
+        }
+
+        await frontend._catchup()
+
+        frontend._on_message.assert_not_awaited()
+        assert frontend._active_channels["D1"] == stamps[1]
+        assert [row.ts for row in SlackWatermarks(_watermark_file()).recent()] == [
+            stamps[1]
+        ]
+        await frontend._catchup()
+        second = frontend._app.client.conversations_history.await_args_list[1]
+        assert second.kwargs["oldest"] == stamps[1]
+
+    async def test_a_raising_message_still_advances_the_position(self, frontend):
+        frontend._active_threads = {("C1", "50.0"): str(time.time() - 60)}
+        missed = str(time.time() - 5)
+        frontend._app.client.conversations_replies = AsyncMock(
+            return_value={"messages": [{"ts": missed}]}
+        )
+        with patch.object(
+            frontend, "_ingest_event", new_callable=AsyncMock, side_effect=RuntimeError
+        ):
+            await frontend._catchup()
+
+        assert frontend._active_threads[("C1", "50.0")] == missed
+
+    async def test_hello_stores_the_app_id(self, frontend):
+        frontend._on_hello = AsyncMock()
+        await frontend._on_socket_message(
+            None, {"type": "hello", "connection_info": {"app_id": "A_COTF"}}, ""
+        )
+        await frontend._hello_task
+
+        assert frontend._app_id == "A_COTF"
+
+    async def test_catchup_skips_posts_by_our_own_app(self, frontend):
+        """Our replies leave the dedupe ledger once it rolls over, and a job
+        result posted with the worker's bot token never enters it."""
+        frontend._app_id = "A_COTF"
+        base = time.time() - 60
+        frontend._active_channels = {"D1": str(base)}
+        frontend._channel_types["D1"] = "im"
+        own = {"user": "U_ALLOWED", "text": "our reply", "app_id": "A_COTF"}
+        own_profile = {
+            "user": "U_ALLOWED",
+            "text": "job result",
+            "bot_profile": {"app_id": "A_COTF"},
+        }
+        real = {"user": "U_ALLOWED", "text": "a real question"}
+        frontend._app.client.conversations_history.return_value = {
+            "messages": [
+                {**real, "ts": str(base + 3)},
+                {**own_profile, "ts": str(base + 2)},
+                {**own, "ts": str(base + 1)},
+            ]
+        }
+
+        await frontend._catchup()
+
+        frontend._on_message.assert_awaited_once()
+        assert "a real question" in frontend._on_message.await_args.args[1]
+        assert frontend._active_channels["D1"] == str(base + 3)
+
+    async def test_bot_token_catchup_skips_its_own_user(self, bot_frontend):
+        base = time.time() - 60
+        bot_frontend._active_channels = {"D1": str(base)}
+        bot_frontend._channel_types["D1"] = "im"
+        bot_frontend._is_bot_conversation = AsyncMock(return_value=True)
+        bot_frontend._app.client.conversations_history = AsyncMock(
+            return_value={
+                "messages": [{"ts": str(base + 1), "user": "U_SELF", "text": "ours"}]
+            }
+        )
+
+        await bot_frontend._catchup()
+
+        bot_frontend._on_message.assert_not_awaited()
+
+    async def test_a_live_event_from_our_app_is_left_alone(self, frontend):
+        """Bolt filters self events on the live path; this rule is catch-up only."""
+        frontend._app_id = "A_COTF"
+        await frontend._ingest_event(
+            _dm(str(time.time()), "from a shortcut", app_id="A_COTF")
+        )
+        frontend._on_message.assert_awaited_once()
+
+    async def test_stop_is_marked_processed_and_moves_the_position(self, frontend):
+        """Unmarked, every reconnect re-read it and aborted the next turn."""
+        frontend._orchestrator = MagicMock()
+        frontend._orchestrator.abort = AsyncMock(return_value=True)
+        event = _dm(str(time.time()), "$stop")
+
+        await frontend._ingest_event(dict(event))
+        await frontend._ingest_event(dict(event))
+
+        frontend._orchestrator.abort.assert_awaited_once()
+        assert event["ts"] in frontend._processed_ts
+        assert frontend._active_channels["D1"] == event["ts"]
+
+    async def test_a_gated_message_moves_the_position_but_stays_unprocessed(
+        self, frontend
+    ):
+        event = _dm(str(time.time()), "over budget")
+        frontend._reply_counts[_session_key("D1", event["ts"])] = 10**6
+        with patch.object(frontend, "_schedule_reply_limit_warning"):
+            await frontend._ingest_event(dict(event))
+
+        frontend._on_message.assert_not_awaited()
+        assert frontend._active_channels["D1"] == event["ts"]
+        assert event["ts"] not in frontend._processed_ts
+
+    async def test_replies_stop_paging_once_past_the_budget(
+        self, frontend, monkeypatch
+    ):
+        monkeypatch.setattr(slack_mod, "MAX_CATCHUP_MESSAGES", 3)
+        base = time.time() - 60
+        frontend._active_threads = {("C1", "50.0"): str(base)}
+        pages = [
+            {
+                "messages": [
+                    {"ts": str(base + 2 * i + 1)},
+                    {"ts": str(base + 2 * i + 2)},
+                ],
+                "response_metadata": {"next_cursor": f"page{i + 2}"},
+            }
+            for i in range(3)
+        ]
+        frontend._app.client.conversations_replies = AsyncMock(side_effect=pages)
+        with patch.object(frontend, "_ingest_event", new_callable=AsyncMock) as ingest:
+            await frontend._catchup()
+
+        assert frontend._app.client.conversations_replies.await_count == 2
+        assert ingest.await_count == 3
+
+    async def test_history_stops_paging_once_past_the_budget(
+        self, frontend, monkeypatch
+    ):
+        # Checked live: with only `oldest` set, the first history page holds the
+        # oldest messages, each page newest first. Stopping keeps the oldest.
+        monkeypatch.setattr(slack_mod, "MAX_CATCHUP_MESSAGES", 3)
+        base = time.time() - 60
+        frontend._active_channels = {"C1": str(base)}
+        pages = [
+            {
+                "messages": [
+                    {"ts": str(base + 2 * i + 2)},
+                    {"ts": str(base + 2 * i + 1)},
+                ],
+                "response_metadata": {"next_cursor": f"page{i + 2}"},
+            }
+            for i in range(3)
+        ]
+        frontend._app.client.conversations_history = AsyncMock(side_effect=pages)
+        with patch.object(frontend, "_ingest_event", new_callable=AsyncMock) as ingest:
+            await frontend._catchup()
+
+        assert frontend._app.client.conversations_history.await_count == 2
+        assert [call.args[0]["ts"] for call in ingest.await_args_list] == [
+            str(base + 1),
+            str(base + 2),
+            str(base + 3),
+        ]
+        assert frontend._active_channels["C1"] == str(base + 3)
+
+    async def test_positions_outside_the_window_are_not_scanned(self, frontend):
+        stale = str(time.time() - 25 * 3600)
+        frontend._active_channels = {"C1": stale}
+        frontend._active_threads = {("C1", "50.0"): stale}
+        frontend._app.client.conversations_replies = AsyncMock()
+
+        await frontend._catchup()
+
+        frontend._app.client.conversations_history.assert_not_awaited()
+        frontend._app.client.conversations_replies.assert_not_awaited()
+        assert frontend._active_channels == {}
+        assert frontend._active_threads == {}
+
+    async def test_a_failed_catchup_task_is_logged(self, frontend, caplog):
+        frontend._on_hello = AsyncMock(side_effect=RuntimeError("scan broke"))
+        with caplog.at_level(logging.ERROR):
+            await frontend._on_socket_message(None, {"type": "hello"}, "")
+            with contextlib.suppress(RuntimeError):
+                await frontend._hello_task
+            await asyncio.sleep(0)
+
+        assert "catch-up failed" in caplog.text
+        assert "scan broke" in caplog.text
+
+    async def test_stop_cancels_a_running_catchup(self, frontend):
+        never = asyncio.Event()
+
+        async def hang(_event, _say):
+            await never.wait()
+
+        frontend._on_hello = hang
+        frontend._handler = None
+        await frontend._on_socket_message(None, {"type": "hello"}, "")
+        await asyncio.sleep(0)
+
+        await frontend.stop()
+
+        assert frontend._hello_task.cancelled()

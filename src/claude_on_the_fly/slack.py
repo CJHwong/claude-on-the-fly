@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import math
@@ -49,6 +50,7 @@ from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
 from claude_on_the_fly.protocol import Frontend, LegacyWorkspace
+from claude_on_the_fly.slack_failed_events import FailedSlackEvents
 from claude_on_the_fly.slack_mrkdwn import (
     SLACK_MESSAGE_CHAR_LIMIT,
     SLACK_TEXT_FIELD_BYTES,
@@ -56,7 +58,12 @@ from claude_on_the_fly.slack_mrkdwn import (
     to_mrkdwn,
 )
 from claude_on_the_fly.slack_mrkdwn import split_blocks as _split_blocks
-from claude_on_the_fly.slack_watermarks import SlackWatermarks, _event_time
+from claude_on_the_fly.slack_watermarks import (
+    DEFAULT_MAX_AGE_SECONDS,
+    MAX_CATCHUP_MESSAGES,
+    SlackWatermarks,
+    _event_time,
+)
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -435,6 +442,9 @@ RATE_LIMIT_RETRIES = 3
 # 2026-10-26 three replies were lost in sixteen minutes this way, each after
 # exactly 30 s.
 TIMEOUT_RETRIES = 2
+# Messages per history or replies page during catch-up. Slack recommends no
+# more than 200; the cursor fetches the rest.
+CATCHUP_PAGE_SIZE = 200
 # Seconds of elapsed time between spinner-verb changes. The order is shuffled
 # once per turn (at message-in); ticks just index into it by elapsed time.
 STATUS_VERB_ROTATE_SECS = 4
@@ -1085,6 +1095,25 @@ def _session_key(channel: str, thread_ts: str | None) -> int:
     return int(hashlib.sha256(raw.encode()).hexdigest()[:16], 16)
 
 
+def _log_catchup_failure(task: asyncio.Task) -> None:
+    """Log a catch-up task's exception, which nothing else reads."""
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        logger.error("catch-up failed: %s", error, exc_info=error)
+
+
+def _advance[K](positions: dict[K, str], key: K, event_ts: str) -> None:
+    """Move one catch-up position forward, never backward.
+
+    The caller has already checked `event_ts` with `_event_time`.
+    """
+    previous_time = _event_time(positions.get(key, ""))
+    if previous_time is None or float(event_ts) >= previous_time:
+        positions[key] = event_ts
+
+
 def _flatten_rich_elements(elements: list[dict]) -> str:
     """Flatten rich_text sub-elements into plain text."""
     parts: list[str] = []
@@ -1384,6 +1413,11 @@ class SlackFrontend(Frontend):
         self._on_message: Callable[[int, str], Awaitable[None]] | None = None
         self._orchestrator: Orchestrator | None = None
         self._warm_task: asyncio.Task | None = None
+        # The catch-up a Socket Mode `hello` starts. Held so it is not
+        # collected mid-run, and so a test can await it.
+        self._hello_task: asyncio.Task | None = None
+        # From the Socket Mode `hello` frame. Catch-up skips this app's posts.
+        self._app_id = ""
         self._sessions: OrderedDict[int, tuple[str, str | None]] = OrderedDict()
         # Slash commands have a channel but no thread timestamp. Remember the
         # most recent registered session in each channel, plus the one that is
@@ -1394,7 +1428,10 @@ class SlackFrontend(Frontend):
         self._ingesting_events: set[tuple[str, str]] = set()
         self._watermarks_cache: tuple[Path, SlackWatermarks] | None = None
         self._watermarks_restored = False
+        self._failed_events_cache: tuple[Path, FailedSlackEvents] | None = None
         self._active_channels: dict[str, str] = {}  # channel_id -> last event_ts
+        # (channel_id, thread_ts) -> last event_ts. History omits thread replies.
+        self._active_threads: dict[tuple[str, str], str] = {}
         self._channel_types: dict[str, str] = {}  # channel_id -> channel_type
         self._own_dm: dict[str, tuple[bool, float]] = {}
         # Membership is authorization state, not immutable channel metadata.
@@ -1571,19 +1608,46 @@ class SlackFrontend(Frontend):
             self._watermarks_cache = cached
         return cached[1]
 
+    @property
+    def _failed_events(self) -> FailedSlackEvents:
+        """Events whose handler raised before any side effect, for a retry."""
+        path = DATA_DIR / "state" / "slack.failed_events.json"
+        cached = self._failed_events_cache
+        if cached is None or cached[0] != path:
+            cached = (path, FailedSlackEvents(path))
+            self._failed_events_cache = cached
+        return cached[1]
+
     def _record_watermark(
-        self, channel: str, event_ts: str, channel_type: str = ""
+        self, channel: str, event_ts: str, channel_type: str = "", thread_ts: str = ""
     ) -> None:
-        """Advance the in-memory and durable catch-up positions together."""
+        """Advance the in-memory and durable catch-up positions together.
+
+        The thread's position advances too, because the history call never
+        returns replies. That includes a thread's root: the reply COTF posts
+        under it starts a thread, and the sender's next reply lands there.
+        """
         if channel_type:
             self._channel_types[channel] = channel_type
-        candidate_time = _event_time(event_ts)
-        if candidate_time is None:
+        if _event_time(event_ts) is None:
             return
-        previous_time = _event_time(self._active_channels.get(channel, ""))
-        if previous_time is None or candidate_time >= previous_time:
-            self._active_channels[channel] = event_ts
-        self._watermarks.record(channel, event_ts, channel_type)
+        # A reply moves only its thread. Moving the channel too let a live reply
+        # that lands during catch-up push the channel past a top-level message
+        # the outage missed.
+        if not thread_ts or thread_ts == event_ts:
+            self._advance_position(channel, "", event_ts, channel_type)
+        if thread_ts:
+            self._advance_position(channel, thread_ts, event_ts, channel_type)
+
+    def _advance_position(
+        self, channel: str, thread_ts: str, event_ts: str, channel_type: str = ""
+    ) -> None:
+        """Move one channel ("" thread) or thread position, in memory and on disk."""
+        if thread_ts:
+            _advance(self._active_threads, (channel, thread_ts), event_ts)
+        else:
+            _advance(self._active_channels, channel, event_ts)
+        self._watermarks.record(channel, event_ts, channel_type, thread_ts=thread_ts)
 
     def _restore_watermarks(self) -> int:
         """Merge recent persisted positions before the initial history scan."""
@@ -1592,9 +1656,12 @@ class SlackFrontend(Frontend):
         self._watermarks_restored = True
         restored = 0
         for entry in self._watermarks.recent():
-            previous_time = _event_time(self._active_channels.get(entry.channel, ""))
-            if previous_time is None or float(entry.ts) > previous_time:
-                self._active_channels[entry.channel] = entry.ts
+            if entry.thread_ts:
+                _advance(
+                    self._active_threads, (entry.channel, entry.thread_ts), entry.ts
+                )
+            else:
+                _advance(self._active_channels, entry.channel, entry.ts)
             if entry.channel_type:
                 self._channel_types[entry.channel] = entry.channel_type
             restored += 1
@@ -1908,8 +1975,6 @@ class SlackFrontend(Frontend):
             logger.debug("raw slack event: %s", event)
             await self._ingest_event(event)
 
-        self._app.event("hello")(self._on_hello)
-
         # Suggestion buttons render on every reply regardless of token kind,
         # and block_actions payloads reach both installs, so their handler is
         # registered unconditionally. The slash command + skill picker are an
@@ -1939,6 +2004,7 @@ class SlackFrontend(Frontend):
             self._warm_task = asyncio.create_task(self._warm_skills())
 
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
+        self._handler.client.message_listeners.append(self._on_socket_message)
         await self._handler.start_async()
         logger.info("Slack connected via Socket Mode (user_id=%s)", self._user_id)
 
@@ -2693,18 +2759,46 @@ class SlackFrontend(Frontend):
         self._own_dm[channel] = (result, now + self._own_dm_ttl)
         return result
 
+    async def _on_socket_message(
+        self, client: object, message: dict, raw: str | None
+    ) -> None:
+        """Start catch-up on each Socket Mode `hello`.
+
+        `hello` is a connection frame, not an Events API event, so Bolt never
+        passes it to an `app.event("hello")` handler. Catch-up was registered
+        that way and never ran, on a start or a reconnect. The SDK calls every
+        message listener for every frame, `hello` included.
+
+        The SDK already runs each frame's listeners under `ensure_future`, so a
+        long scan does not hold up live frames. The task is kept for `stop()`:
+        a scan can be hundreds of Slack calls, and shutdown cancels it rather
+        than waiting. Its failure is logged by the done callback, because a
+        task's exception otherwise goes unread.
+
+        The frame also names this app (`connection_info.app_id`). Catch-up uses
+        it to skip the app's own posts.
+        """
+        if message.get("type") != "hello":
+            return
+        app_id = (message.get("connection_info") or {}).get("app_id")
+        if isinstance(app_id, str) and app_id:
+            self._app_id = app_id
+        self._hello_task = asyncio.create_task(self._on_hello(message, None))
+        self._hello_task.add_done_callback(_log_catchup_failure)
+
     async def _on_hello(self, event, say):
         if not self._connected_once:
             self._connected_once = True
             restored = self._restore_watermarks()
-            if restored:
-                logger.info(
-                    "Socket Mode: initial connection, running catch-up for %d recent conversation(s)",
-                    restored,
-                )
-                await self._catchup()
-                return
-            logger.info("Socket Mode: initial connection")
+            # Always, even with nothing restored: events that failed before the
+            # restart are stored apart from the watermarks, and the restart that
+            # ships a handler fix is exactly when they must replay.
+            logger.info(
+                "Socket Mode: initial connection, running catch-up for %d recent conversation(s) and %d failed event(s)",
+                restored,
+                len(self._failed_events),
+            )
+            await self._catchup()
             return
         logger.info("Socket Mode: reconnected, running catch-up")
         await self._catchup()
@@ -2721,8 +2815,10 @@ class SlackFrontend(Frontend):
             await self._process_event(event)
         except Exception as exc:
             # Bolt catches this and keeps the daemon up, so a handler bug fails
-            # every message in silence. Report it, then re-raise so Bolt still
-            # logs its own line for the watchers that match it.
+            # every message in silence. Keep it for a retry, report it, then
+            # re-raise so Bolt still logs its own line for the watchers that
+            # match it.
+            self._keep_failed_event(event)
             if self._orchestrator is not None:
                 await self._orchestrator.note_handler_failure(exc)
             raise
@@ -2730,6 +2826,26 @@ class SlackFrontend(Frontend):
             self._ingesting_events.remove(event_key)
         if self._orchestrator is not None:
             self._orchestrator.note_handler_success()
+
+    def _keep_failed_event(self, event: dict) -> None:
+        """Store an event that raised, unless part of it already ran.
+
+        `_process_event` marks an event processed at the point it hands off a
+        turn or runs a command. Before that point nothing has a side effect, so
+        a replay is safe. After it, a replay could run the turn twice.
+        """
+        channel = event.get("channel", "")
+        ts = event.get("ts", "")
+        if ts in self._processed_ts:
+            logger.info(
+                "slack %s/%s: handler failed, not kept for retry: already marked processed",
+                channel,
+                ts,
+            )
+            # A replayed copy that got this far must not replay again.
+            self._failed_events.discard(channel, ts)
+            return
+        self._failed_events.record_failure(event)
 
     async def _process_event(self, event: dict) -> None:
         subtype = event.get("subtype")
@@ -2812,7 +2928,7 @@ class SlackFrontend(Frontend):
                 )
                 if not process:
                     self._processed_ts.add(ts)
-                    self._record_watermark(channel, ts, channel_type)
+                    self._record_watermark(channel, ts, channel_type, thread_ts)
                     audit_log = (
                         logger.info if policy.audit_dropped_events else logger.debug
                     )
@@ -2900,6 +3016,10 @@ class SlackFrontend(Frontend):
         # threads (it's a message, not a slash command).
         if text.strip() == STOP_COMMAND:
             logger.info("slack %s/%s: %s", channel, thread_ts, STOP_COMMAND)
+            # Before the abort, like $compact: unmarked, every reconnect re-read
+            # this stop and aborted whatever turn ran next.
+            self._processed_ts.add(ts)
+            self._record_watermark(channel, ts, channel_type, thread_ts)
             stopped = False
             if self._orchestrator is not None:
                 stopped = await self._orchestrator.abort(session_id)
@@ -2922,7 +3042,7 @@ class SlackFrontend(Frontend):
             # so mirror it here or a reconnect re-ingests the trigger and
             # compacts a second time.
             self._processed_ts.add(ts)
-            self._record_watermark(channel, ts, channel_type)
+            self._record_watermark(channel, ts, channel_type, thread_ts)
             if self._orchestrator is None:
                 await self._post_notice(
                     channel, thread_ts, "Not connected to a session yet."
@@ -2962,7 +3082,7 @@ class SlackFrontend(Frontend):
             # This branch returns before the normal path's catch-up bookkeeping,
             # so mirror it here or a reconnect re-ingests the command.
             self._processed_ts.add(ts)
-            self._record_watermark(channel, ts, channel_type)
+            self._record_watermark(channel, ts, channel_type, thread_ts)
             if self._orchestrator is None:
                 await self._post_notice(
                     channel, thread_ts, "Not connected to a session yet."
@@ -3006,7 +3126,7 @@ class SlackFrontend(Frontend):
             # _catchup re-fetches it after a disconnect, and cache the channel
             # type so the recovered messages gate identically to the live path.
             self._processed_ts.add(ts)
-            self._record_watermark(channel, ts, channel_type)
+            self._record_watermark(channel, ts, channel_type, thread_ts)
             if not task:
                 # A bare trigger is somebody asking what is already running,
                 # which is the one moment the answer is worth more than the
@@ -3082,6 +3202,10 @@ class SlackFrontend(Frontend):
                 thread_ts,
                 reply_soft_limit(),
             )
+            # The position moves, so a reconnect does not re-read it and post the
+            # notice again, and a restart does not run it without Continue. It
+            # stays unprocessed: the Continue button replays it from the backlog.
+            self._record_watermark(channel, ts, channel_type, thread_ts)
             await self._mark_gated(session_id, event)
             self._schedule_reply_limit_warning(
                 session_id, channel, thread_ts, sender_id
@@ -3107,8 +3231,6 @@ class SlackFrontend(Frontend):
 
         self._session_sender_ids[session_id] = sender_id
         self._account_senders.setdefault(session_id, sender_id)
-        self._processed_ts.add(ts)
-        self._record_watermark(channel, ts, channel_type)
 
         cover_parts: list[str] = []
         if file_lines:
@@ -3128,6 +3250,14 @@ class SlackFrontend(Frontend):
         elif forwards:
             segments.append(sender_marker(sender_id, sender))
         final_text = "\n\n".join(segments)
+
+        # Marked here, once the turn is built, not before building it: a raise
+        # up to this point has run nothing, so `_ingest_event` keeps the event
+        # for a retry. Past this line the turn is handed off, and a retry could
+        # run it twice. Still before the `await` below, so a redelivery that
+        # lands while the turn is handed off is a duplicate.
+        self._processed_ts.add(ts)
+        self._record_watermark(channel, ts, channel_type, thread_ts)
 
         self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
         silent = bool(bot_id and bot_id in self._silent_sender_ids) or (
@@ -3151,32 +3281,178 @@ class SlackFrontend(Frontend):
             await self._on_message(session_id, final_text)
 
     async def _catchup(self) -> None:
-        """Fetch recent messages from active channels to recover missed events."""
-        if not self._active_channels:
-            return
-        for channel, last_ts in list(self._active_channels.items()):
-            try:
-                resp = await self._app.client.conversations_history(
-                    channel=channel, oldest=last_ts, inclusive=False, limit=20
-                )
-            except Exception as exc:
-                logger.warning(
-                    "catch-up: failed to fetch history for %s: %s", channel, exc
-                )
-                continue
-            messages = resp.get("messages", [])
+        """Retry failed events, then fetch what active conversations missed.
+
+        Channels are read with `conversations.history`, threads with
+        `conversations.replies`, because history never returns thread replies.
+        One scan ingests at most `MAX_CATCHUP_MESSAGES`, which keeps it inside
+        the processed-event ledger. Every message read moves its position,
+        whatever became of it, so the next scan continues past the cap.
+        """
+        await self._replay_failed_events()
+        targets = self._catchup_targets()
+        budget = MAX_CATCHUP_MESSAGES
+        for index, (channel, thread_ts, last_ts) in enumerate(targets):
+            messages = await self._fetch_missed(channel, thread_ts, last_ts, budget)
             if not messages:
                 continue
-            logger.info("catch-up: %d new messages in %s", len(messages), channel)
-            cached_type = self._channel_types.get(channel, "")
-            for msg in sorted(messages, key=lambda m: m.get("ts", "")):
-                if "channel" not in msg:
-                    msg["channel"] = channel
-                if "channel_type" not in msg:
-                    msg["channel_type"] = cached_type
-                await self._ingest_event(msg)
+            where = f"{channel}/{thread_ts}" if thread_ts else channel
+            logger.info("catch-up: %d new messages in %s", len(messages), where)
+            if len(messages) > budget:
+                logger.warning(
+                    "catch-up: cap of %d messages reached; %d message(s) left in %s and %d conversation(s) not scanned until the next catch-up",
+                    MAX_CATCHUP_MESSAGES,
+                    len(messages) - budget,
+                    where,
+                    len(targets) - index - 1,
+                )
+                await self._ingest_missed(channel, thread_ts, messages[:budget])
+                return
+            budget -= len(messages)
+            await self._ingest_missed(channel, thread_ts, messages)
+
+    def _catchup_targets(self) -> list[tuple[str, str, str]]:
+        """Positions inside the restore window, as (channel, thread_ts, ts).
+
+        The window is the one startup restore uses. Positions outside it are
+        dropped from memory too, so the maps cannot grow for the life of the
+        process.
+        """
+        cutoff = time.time() - DEFAULT_MAX_AGE_SECONDS
+        targets: list[tuple[str, str, str]] = []
+        for channel, last_ts in list(self._active_channels.items()):
+            if (_event_time(last_ts) or 0) < cutoff:
+                del self._active_channels[channel]
+                continue
+            targets.append((channel, "", last_ts))
+        for key, last_ts in list(self._active_threads.items()):
+            if (_event_time(last_ts) or 0) < cutoff:
+                del self._active_threads[key]
+                continue
+            targets.append((key[0], key[1], last_ts))
+        return targets
+
+    async def _fetch_missed(
+        self, channel: str, thread_ts: str, last_ts: str, budget: int
+    ) -> list[dict]:
+        """Messages after `last_ts` in one channel or thread, oldest first.
+
+        Paging stops once more than `budget` messages are held: the rest is past
+        the cap anyway. Both calls give the oldest page first when only `oldest`
+        is set (history lists each page newest first), so what is kept is the
+        oldest, and the position never passes a message nobody read.
+        """
+        messages: list[dict] = []
+        cursor = ""
+        while True:
+            page = {"cursor": cursor} if cursor else {}
+            try:
+                if thread_ts:
+                    resp = await self._app.client.conversations_replies(
+                        channel=channel,
+                        ts=thread_ts,
+                        oldest=last_ts,
+                        inclusive=False,
+                        limit=CATCHUP_PAGE_SIZE,
+                        **page,
+                    )
+                else:
+                    resp = await self._app.client.conversations_history(
+                        channel=channel,
+                        oldest=last_ts,
+                        inclusive=False,
+                        limit=CATCHUP_PAGE_SIZE,
+                        **page,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "catch-up: failed to fetch %s for %s: %s",
+                    "replies" if thread_ts else "history",
+                    f"{channel}/{thread_ts}" if thread_ts else channel,
+                    exc,
+                )
+                break
+            # Slack returns the thread root on every replies page.
+            messages.extend(
+                msg for msg in resp.get("messages", []) if msg.get("ts") != thread_ts
+            )
+            cursor = (resp.get("response_metadata") or {}).get("next_cursor", "")
+            if not cursor or len(messages) > budget:
+                break
+        return sorted(messages, key=lambda msg: _event_time(msg.get("ts", "")) or 0)
+
+    async def _ingest_missed(
+        self, channel: str, thread_ts: str, messages: list[dict]
+    ) -> None:
+        """Ingest one conversation's missed messages, then move its position.
+
+        The position moves past every message read: one that ran, was skipped,
+        was gated, or raised. A raise is already in the failed store, so
+        stopping here would only strand the messages after it, and a skip that
+        left the position behind was read again by every later scan.
+        """
+        cached_type = self._channel_types.get(channel, "")
+        for msg in messages:
+            if "channel" not in msg:
+                msg["channel"] = channel
+            if "channel_type" not in msg:
+                msg["channel_type"] = cached_type
+            ts = msg.get("ts", "")
+            if self._is_own_post(msg):
+                self._skip(False, "catch-up: our own post ts=%s", ts)
+            else:
+                try:
+                    await self._ingest_event(msg)
+                except Exception as exc:
+                    logger.warning("catch-up: %s/%s raised: %s", channel, ts, exc)
+            if _event_time(ts) is not None:
+                self._advance_position(
+                    channel, thread_ts, ts, msg.get("channel_type", "")
+                )
+
+    def _is_own_post(self, msg: dict) -> bool:
+        """Whether a message read back by catch-up was posted by this app.
+
+        Catch-up only. Live delivery has Bolt's own self-event filter. Here the
+        dedupe ledger and `_our_sent_timestamps` are the only guards, both roll
+        over, and a job result posted by the worker's bot token never enters
+        this process's ledger at all.
+        """
+        app_id = msg.get("app_id") or (msg.get("bot_profile") or {}).get("app_id")
+        if self._app_id and app_id == self._app_id:
+            return True
+        return self._is_bot_token and msg.get("user") == self._user_id
+
+    async def _replay_failed_events(self) -> None:
+        """Run stored failed events again, oldest first.
+
+        `_ingest_event` counts a repeat failure and drops an event that failed
+        after it was marked processed. The store's 24-hour window drops the
+        rest. A clean
+        return, whether it ran a turn or skipped a duplicate, clears it.
+        """
+        for event in self._failed_events.pending():
+            channel = event.get("channel", "")
+            ts = event.get("ts", "")
+            try:
+                await self._ingest_event(event)
+            except Exception as exc:
+                logger.warning(
+                    "catch-up: replay of failed event %s/%s raised: %s",
+                    channel,
+                    ts,
+                    exc,
+                )
+                continue
+            logger.info("catch-up: replayed failed event %s/%s", channel, ts)
+            self._failed_events.discard(channel, ts)
 
     async def stop(self) -> None:
+        hello_task = self._hello_task
+        if hello_task is not None and not hello_task.done():
+            hello_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hello_task
         for session_id in list(self._gate_notices):
             self._cancel_gate_notice(session_id)
         for key in list(self._mention_notices):

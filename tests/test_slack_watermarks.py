@@ -113,3 +113,68 @@ class TestSlackWatermarks:
 
         assert watermarks.recent(now=101)[0].channel == "D1"
         assert "could not write" in caplog.text
+
+
+class TestThreadWatermarks:
+    def test_a_thread_entry_sits_beside_its_channel_entry(self, tmp_path):
+        path = tmp_path / "w.json"
+        watermarks = SlackWatermarks(path)
+        watermarks.record("C1", "105.0", "channel")
+        watermarks.record("C1", "105.0", "channel", thread_ts="100.0")
+
+        restored = SlackWatermarks(path).recent(now=106)
+        assert [(row.channel, row.thread_ts, row.ts) for row in restored] == [
+            ("C1", "", "105.0"),
+            ("C1", "100.0", "105.0"),
+        ]
+
+    def test_threads_of_one_channel_advance_independently(self, tmp_path):
+        watermarks = SlackWatermarks(tmp_path / "w.json")
+        watermarks.record("C1", "105.0", thread_ts="100.0")
+        watermarks.record("C1", "103.0", thread_ts="101.0")
+        watermarks.record("C1", "104.0", thread_ts="100.0")
+
+        by_thread = {row.thread_ts: row.ts for row in watermarks.recent(now=106)}
+        assert by_thread == {"100.0": "105.0", "101.0": "103.0"}
+
+    def test_an_old_format_file_loads_as_channel_entries(self, tmp_path):
+        path = tmp_path / "w.json"
+        path.write_text(
+            json.dumps(
+                {"channels": [{"channel": "D1", "ts": "100.0", "channel_type": "im"}]}
+            )
+        )
+
+        (entry,) = SlackWatermarks(path).recent(now=101)
+        assert (entry.channel, entry.thread_ts, entry.ts) == ("D1", "", "100.0")
+
+    def test_a_row_with_an_invalid_thread_is_ignored(self, tmp_path):
+        path = tmp_path / "w.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "channels": [
+                        {"channel": "C1", "ts": "100.0", "thread_ts": 7},
+                        {"channel": "C1", "ts": "100.0", "thread_ts": "bad"},
+                        {"channel": "C1", "ts": "100.0", "thread_ts": "99.0"},
+                    ]
+                }
+            )
+        )
+
+        assert [row.thread_ts for row in SlackWatermarks(path).recent(now=101)] == [
+            "99.0"
+        ]
+
+    def test_a_five_hour_old_watermark_is_restored(self, tmp_path):
+        watermarks = SlackWatermarks(tmp_path / "w.json")
+        watermarks.record("D1", "1000.0", "im")
+
+        assert [row.channel for row in watermarks.recent(now=1000 + 5 * 3600)] == ["D1"]
+        assert watermarks.recent(now=1000 + 25 * 3600) == ()
+
+    def test_an_invalid_thread_is_not_recorded(self, tmp_path):
+        watermarks = SlackWatermarks(tmp_path / "w.json")
+        watermarks.record("C1", "100.0", thread_ts="bad")
+
+        assert len(watermarks) == 0
