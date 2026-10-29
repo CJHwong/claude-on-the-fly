@@ -314,3 +314,16 @@ for exit diagnostics. Cumulative narration is not a response-size violation.
 The rollout remains the durable execution record. Both readers must be cancelled
 and awaited when the turn is cancelled or the stdout cap is exceeded, so a
 surviving descendant holding a pipe cannot strand the reader tasks.
+
+### Codex capacity recovery
+
+A terminal `server_overloaded` error permits three retries after 10, 30, and 60 seconds.
+The backend also recognizes the older capacity message when Codex omits the error code.
+Retries keep the selected model and resume the same native thread.
+The continuation prompt requires a state check before actions and prohibits repetition of completed actions.
+After tool activity, recovery requires recorded results for every tool call.
+Missing thread identifiers or incomplete results stop recovery.
+All attempts and waits share the original timeout budget, and cancellation stops a pending wait.
+The backend preserves the thread mapping even if every attempt fails.
+Usage and tool counts include failed attempts that precede recovery.
+Authentication errors, access errors, and unrelated failures do not enter capacity recovery.

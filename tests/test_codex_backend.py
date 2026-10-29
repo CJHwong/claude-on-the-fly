@@ -3935,3 +3935,22 @@ class TestQuotaExhaustion:
         )
         assert parsed["tools_started"]
         assert not parsed["resume_ready"]
+
+
+async def test_structured_capacity_code_survives_a_changed_message(tmp_path):
+    with pytest.raises(codex_mod._CapacityError) as raised:
+        await _run_exec(
+            _exec_proc(1),
+            tmp_path,
+            records=(
+                _session_meta("capacity-thread"),
+                _task_complete(
+                    error={
+                        "message": "Provider is busy",
+                        "codex_error_info": "server_overloaded",
+                    }
+                ),
+            ),
+        )
+    assert raised.value.result["thread_id"] == "capacity-thread"
+    assert raised.value.result["error_code"] == "server_overloaded"
