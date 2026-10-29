@@ -73,6 +73,26 @@ COMPACT_POLL_S = 0.1
 # the caller deliver the reply already in hand.
 POST_TURN_EXIT_GRACE = 30.0
 
+CAPACITY_RETRY_DELAYS = (10, 30, 60)
+CAPACITY_RESUME_PROMPT = (
+    "Continue the interrupted request from the recorded tool results. "
+    "The model service was at capacity. Check the current state before any "
+    "action. Do not repeat completed actions."
+)
+
+
+class _CapacityError(agent.AgentTurnError):
+    """Keep the failed turn so a retry can preserve its work."""
+
+    def __init__(self, result: dict) -> None:
+        super().__init__(
+            "Codex selected model is at capacity",
+            "The selected model is at capacity, so this request stopped "
+            "without a final answer. Try again shortly, or ask me to use "
+            "a different model.",
+        )
+        self.result = result
+
 
 async def _kill_once_quiet_after_turn(
     proc: asyncio.subprocess.Process, follower: _RolloutFollower
@@ -312,6 +332,7 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
     last_assistant_text = ""
     usage: dict = {}
     error: str | None = None
+    error_code: str | None = None
     completed = False
     tool_items: list[tuple[str, str]] = []
     tool_calls: list[tuple[str, str]] = []
@@ -352,6 +373,8 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
             body = payload.get("last_agent_message") or body
             failure = payload.get("error")
             if failure is not None:
+                if isinstance(failure, dict):
+                    error_code = failure.get("codex_error_info")
                 detail = (
                     failure.get("message") if isinstance(failure, dict) else failure
                 )
@@ -365,6 +388,7 @@ def parse_codex_rollout(records: Iterable[dict]) -> dict:
         "last_assistant_text": last_assistant_text,
         "usage": usage,
         "error": error,
+        "error_code": error_code,
         "completed": completed,
         "tool_counts": _count_tool_calls(tool_items, tool_calls),
     }
@@ -1216,12 +1240,12 @@ async def _run_codex_exec(
                 "I couldn't finish this request because the model service denied "
                 "access (403). The failure was logged.",
             )
-        if "selected model is at capacity" in detail.casefold():
-            raise agent.AgentTurnError(
-                "Codex selected model is at capacity",
-                "The selected model is at capacity, so this request stopped "
-                "without a final answer. Try again shortly, or ask me to use "
-                "a different model.",
+        if (
+            parsed.get("error_code") == "server_overloaded"
+            or "selected model is at capacity" in detail.casefold()
+        ):
+            raise _CapacityError(
+                {**parsed, "thread_id": parsed.get("thread_id") or thread_id}
             )
         raise RuntimeError(detail)
     if returncode != 0:
@@ -1392,6 +1416,79 @@ class CodexBackend:
         # take claude-pty's mirror away too.
         self._pty = pty
 
+    async def _run_with_capacity_retry(
+        self,
+        workspace: Path,
+        session_uuid: str,
+        base: list[str],
+        thread_id: str | None,
+        prompt: str,
+        timeout: float | None,
+        gate: _FirstTurnGate | _ResumedTurnGate | None = None,
+    ) -> dict:
+        """Resume recorded work after overload, within one deadline."""
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        previous: dict | None = None
+        attempt = 0
+        while True:
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
+                raise RuntimeError("Codex CLI timed out during capacity recovery")
+            cmd = [*base, "resume", thread_id, prompt] if thread_id else [*base, prompt]
+            try:
+                result = await _run_codex_exec(
+                    workspace,
+                    cmd,
+                    timeout=remaining,
+                    thread_id=thread_id,
+                    interactive=self._interactive_argv(workspace, thread_id, prompt)
+                    if self._pty
+                    else None,
+                    gate=gate,
+                )
+                if previous and previous.get("tool_counts"):
+                    result["resume_ready"] = not result.get(
+                        "tools_started"
+                    ) or result.get("resume_ready", False)
+                    result["tools_started"] = True
+                return (
+                    {**result, **_merge_codex_results(previous, result)}
+                    if previous
+                    else result
+                )
+            except quota.AccountExhaustedError as failure:
+                if previous and previous.get("tool_counts"):
+                    failure.resume_ready = (
+                        not failure.tools_started or failure.resume_ready
+                    )
+                    failure.tools_started = True
+                raise
+            except _CapacityError as failure:
+                failed = failure.result
+                thread_id = failed.get("thread_id") or thread_id
+                if thread_id:
+                    codex_state.write_thread_id(workspace, session_uuid, thread_id)
+                safe = not failed.get("tools_started") or failed.get("resume_ready")
+                if not thread_id or not safe or attempt == len(CAPACITY_RETRY_DELAYS):
+                    raise
+                delay = CAPACITY_RETRY_DELAYS[attempt]
+                if deadline is not None and time.monotonic() + delay >= deadline:
+                    raise
+                previous = (
+                    _merge_codex_results(previous, failed) if previous else failed
+                )
+                logger.warning(
+                    "codex: capacity retry %s/%s in %ss, thread=%s",
+                    attempt + 1,
+                    len(CAPACITY_RETRY_DELAYS),
+                    delay,
+                    thread_id,
+                )
+                attempt += 1
+                await asyncio.sleep(delay)
+                prompt = CAPACITY_RESUME_PROMPT
+                gate = None
+
     async def run(
         self,
         workspace: Path,
@@ -1460,10 +1557,8 @@ class CodexBackend:
             logger.debug(
                 "codex: resuming thread=%s session=%s", existing_thread, session_uuid
             )
-            cmd = [*base, "resume", existing_thread, composed_prompt]
         else:
             logger.debug("codex: starting new thread session=%s", session_uuid)
-            cmd = [*base, composed_prompt]
 
         # Snapshot the thread's cumulative token usage before invoking codex
         # so we can compute this exec's per-turn delta afterward. For fresh
@@ -1487,19 +1582,14 @@ class CodexBackend:
         started_at = time.monotonic()
         try:
             async with _first_turn_guard(workspace, existing_thread) as gate:
-                result = await _run_codex_exec(
+                result = await self._run_with_capacity_retry(
                     workspace,
-                    cmd,
-                    timeout=timeout,
-                    thread_id=existing_thread,
-                    interactive=(
-                        self._interactive_argv(
-                            workspace, existing_thread, composed_prompt
-                        )
-                        if self._pty
-                        else None
-                    ),
-                    gate=gate,
+                    session_uuid,
+                    base,
+                    existing_thread,
+                    composed_prompt,
+                    timeout,
+                    gate,
                 )
         except quota.AccountExhaustedError as failure:
             if failure.thread_id and not existing_thread:
@@ -1545,27 +1635,16 @@ class CodexBackend:
                     "codex: no visible reply, retrying with nudge, session=%s",
                     session_uuid,
                 )
-                retry_cmd = [
-                    *base,
-                    "resume",
-                    thread_for_retry,
-                    nudge_prompt or NUDGE_PROMPT,
-                ]
                 retry_started = time.monotonic()
                 retry_thread = result.get("thread_id") or existing_thread
                 try:
-                    retry_result = await _run_codex_exec(
+                    retry_result = await self._run_with_capacity_retry(
                         workspace,
-                        retry_cmd,
-                        timeout=timeout,
-                        thread_id=retry_thread,
-                        interactive=(
-                            self._interactive_argv(
-                                workspace, retry_thread, nudge_prompt or NUDGE_PROMPT
-                            )
-                            if self._pty
-                            else None
-                        ),
+                        session_uuid,
+                        base,
+                        retry_thread,
+                        nudge_prompt or NUDGE_PROMPT,
+                        max(0, timeout - duration) if timeout is not None else None,
                     )
                 except quota.AccountExhaustedError as failure:
                     previous_tools = result.get("tools_started") or bool(
@@ -1611,7 +1690,11 @@ class CodexBackend:
         )
         # A rollout that moved under the turn makes the earlier count refer to
         # another file's history, so only this exec's own last record is safe.
-        start = pre_event_count if pre_rollout == post_rollout else len(events) - 1
+        start = (
+            pre_event_count
+            if pre_rollout == post_rollout or pre_rollout is None
+            else len(events) - 1
+        )
         fresh = events[max(start, 0) :]
         usage = _usage_from_events(fresh) if fresh else (result.get("usage") or {})
         tokens_in = usage.get("input_tokens", 0)
