@@ -12,7 +12,7 @@ import random
 import re
 import time
 from collections import OrderedDict, deque
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,7 +49,7 @@ from claude_on_the_fly.event_dedupe import ProcessedEvents
 from claude_on_the_fly.heartbeat import live_pid
 from claude_on_the_fly.jobs.core import Job, JobQueue, QueueRow
 from claude_on_the_fly.jobs.registry import make_queue
-from claude_on_the_fly.protocol import Frontend, LegacyWorkspace
+from claude_on_the_fly.protocol import Frontend, IncomingMessageHandler, LegacyWorkspace
 from claude_on_the_fly.slack_failed_events import FailedSlackEvents
 from claude_on_the_fly.slack_mrkdwn import (
     SLACK_MESSAGE_CHAR_LIMIT,
@@ -64,6 +64,7 @@ from claude_on_the_fly.slack_watermarks import (
     SlackWatermarks,
     _event_time,
 )
+from claude_on_the_fly.source_event import SourceEvent
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -1412,7 +1413,7 @@ class SlackFrontend(Frontend):
             AsyncTimeoutRetryHandler(max_retry_count=TIMEOUT_RETRIES)
         )
         self._handler: AsyncSocketModeHandler | None = None
-        self._on_message: Callable[[int, str], Awaitable[None]] | None = None
+        self._on_message: IncomingMessageHandler | None = None
         self._orchestrator: Orchestrator | None = None
         self._warm_task: asyncio.Task | None = None
         # The catch-up a Socket Mode `hello` starts. Held so it is not
@@ -1969,7 +1970,7 @@ class SlackFrontend(Frontend):
 
     # --- Lifecycle ---
 
-    async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
+    async def start(self, on_message: IncomingMessageHandler) -> None:
         self._on_message = on_message
 
         @self._app.event({"type": "message"})
@@ -2422,7 +2423,7 @@ class SlackFrontend(Frontend):
             self._reply_counts[session_id] = 0
             replay = dict(event)
             replay["text"] = f"{mention} {event.get('text') or ''}".strip()
-            await self._ingest_event(replay)
+            await self._ingest_event(replay, original_event=event, replayed=True)
             ts = str(event.get("ts") or "")
             logger.info(
                 "replay: ran untagged message %s from %s (dispatched=%s)",
@@ -2460,7 +2461,7 @@ class SlackFrontend(Frontend):
             ts = str(event.get("ts") or "")
             replay = dict(event)
             replay["text"] = f"{CONTINUE_COMMAND} {event.get('text') or ''}".strip()
-            await self._ingest_event(replay)
+            await self._ingest_event(replay, original_event=event, replayed=True)
             # `_ingest_event` returns nothing whether it ran the message or
             # dropped it, and every drop logs at debug. The ts is marked
             # processed on the one path that reaches the agent, so this is what
@@ -2805,7 +2806,9 @@ class SlackFrontend(Frontend):
         logger.info("Socket Mode: reconnected, running catch-up")
         await self._catchup()
 
-    async def _ingest_event(self, event: dict) -> None:
+    async def _ingest_event(
+        self, event: dict, *, original_event: dict | None = None, replayed: bool = False
+    ) -> None:
         # Reconnects can deliver the same event while its first copy awaits Slack.
         # Keep failed and gated events eligible for a later replay.
         event_key = (event.get("channel", ""), event.get("ts", ""))
@@ -2814,7 +2817,9 @@ class SlackFrontend(Frontend):
             return
         self._ingesting_events.add(event_key)
         try:
-            await self._process_event(event)
+            await self._process_event(
+                event, original_event=original_event, replayed=replayed
+            )
         except Exception as exc:
             # Bolt catches this and keeps the daemon up, so a handler bug fails
             # every message in silence. Keep it for a retry, report it, then
@@ -2849,7 +2854,9 @@ class SlackFrontend(Frontend):
             return
         self._failed_events.record_failure(event)
 
-    async def _process_event(self, event: dict) -> None:
+    async def _process_event(
+        self, event: dict, *, original_event: dict | None = None, replayed: bool = False
+    ) -> None:
         subtype = event.get("subtype")
         bot_id = event.get("bot_id", "")
         # App/bot posts (HubSpot, Jira, etc.) arrive as subtype=bot_message with
@@ -2898,6 +2905,25 @@ class SlackFrontend(Frontend):
             channel, ""
         )
         forwards = _extract_forwards(event)
+        # Snapshot before any await or routing rewrite. A button replay adds
+        # a mention/$continue for routing; neither is original source text.
+        source = original_event if original_event is not None else event
+        profile = source.get("bot_profile") or {}
+        source_event = SourceEvent(
+            platform="slack",
+            channel_id=source.get("channel", ""),
+            ts=source.get("ts", ""),
+            thread_ts=source.get("thread_ts") or source.get("ts", ""),
+            text=source.get("text", ""),
+            user=source.get("user", ""),
+            bot_id=source.get("bot_id", ""),
+            app_id=source.get("app_id", ""),
+            subtype=source.get("subtype") or "",
+            bot_profile_app_id=profile.get("app_id", ""),
+            bot_profile_user_id=profile.get("user_id", ""),
+            is_forwarded=bool(forwards),
+            is_replayed=replayed,
+        )
         extra_content = _flatten_primary_content(event)
         fwd_refs = ",".join(
             f"{f.get('channel_id') or '?'}/{f.get('ts') or '?'}" for f in forwards
@@ -3280,7 +3306,7 @@ class SlackFrontend(Frontend):
             # Charged only on the path that reaches the agent, so a message the
             # frontend drops never spends the thread's budget.
             self._charge_turn(session_id)
-            await self._on_message(session_id, final_text)
+            await self._on_message(session_id, final_text, source_event=source_event)
 
     async def _catchup(self) -> None:
         """Retry failed events, then fetch what active conversations missed.
@@ -3404,7 +3430,7 @@ class SlackFrontend(Frontend):
                 self._skip(False, "catch-up: our own post ts=%s", ts)
             else:
                 try:
-                    await self._ingest_event(msg)
+                    await self._ingest_event(msg, replayed=True)
                 except Exception as exc:
                     logger.warning("catch-up: %s/%s raised: %s", channel, ts, exc)
             if _event_time(ts) is not None:
@@ -3437,7 +3463,7 @@ class SlackFrontend(Frontend):
             channel = event.get("channel", "")
             ts = event.get("ts", "")
             try:
-                await self._ingest_event(event)
+                await self._ingest_event(event, replayed=True)
             except Exception as exc:
                 logger.warning(
                     "catch-up: replay of failed event %s/%s raised: %s",

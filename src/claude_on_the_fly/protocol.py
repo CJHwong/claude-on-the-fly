@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 from claude_on_the_fly.agent import Response
 from claude_on_the_fly.approvals import ApprovalRequest
+from claude_on_the_fly.source_event import SourceEvent
+
+
+class IncomingMessageHandler(Protocol):
+    def __call__(
+        self, chat_id: int, text: str, *, source_event: SourceEvent | None = None
+    ) -> Awaitable[None]: ...
 
 
 def interrupted_notice(*, running: bool, queued: int) -> str:
@@ -64,7 +71,7 @@ class Frontend(ABC):
         """Optional hook so orchestrator can inject itself back."""
 
     @abstractmethod
-    async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
+    async def start(self, on_message: IncomingMessageHandler) -> None:
         """Start listening. Call on_message(chat_id, text) for each incoming message."""
 
     @abstractmethod

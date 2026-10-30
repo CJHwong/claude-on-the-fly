@@ -40,10 +40,12 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from claude_on_the_fly.source_event import SourceEvent
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,7 @@ class PendingTurn:
     # loads and still ages out on its own acceptance time.
     recorded_at: float = 0.0
     replays: int = 0
+    source_event: SourceEvent | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +104,9 @@ class PendingTurn:
             "phase": self.phase,
             "recorded_at": self.recorded_at,
             "replays": self.replays,
+            "source_event": asdict(self.source_event)
+            if self.source_event is not None
+            else None,
         }
 
     @classmethod
@@ -164,6 +170,7 @@ class PendingTurn:
             replays=max(0, replays)
             if isinstance(replays, int) and not isinstance(replays, bool)
             else 0,
+            source_event=SourceEvent.from_dict(data.get("source_event")),
         )
 
 

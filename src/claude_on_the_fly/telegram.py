@@ -10,7 +10,6 @@ import os
 import secrets
 import tempfile
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -40,7 +39,7 @@ from claude_on_the_fly.agent import (
     workspace_path,
 )
 from claude_on_the_fly.approvals import ApprovalRequest
-from claude_on_the_fly.protocol import Frontend, LegacyWorkspace
+from claude_on_the_fly.protocol import Frontend, IncomingMessageHandler, LegacyWorkspace
 
 if TYPE_CHECKING:
     from claude_on_the_fly.orchestrator import Orchestrator
@@ -68,7 +67,7 @@ class TelegramFrontend(Frontend):
         self._token = token
         self._allowed_user_id = allowed_user_id
         self._app: Application | None = None
-        self._on_message: Callable[[int, str], Awaitable[None]] | None = None
+        self._on_message: IncomingMessageHandler | None = None
         self._orchestrator: Orchestrator | None = None
         self._media_groups: dict[str, dict] = {}
         # The event loop only holds a weak reference to a bare create_task, so a
@@ -222,7 +221,7 @@ class TelegramFrontend(Frontend):
 
     # --- Lifecycle ---
 
-    async def start(self, on_message: Callable[[int, str], Awaitable[None]]) -> None:
+    async def start(self, on_message: IncomingMessageHandler) -> None:
         self._on_message = on_message
         self._load_sessions()
         self._app = Application.builder().token(self._token).build()

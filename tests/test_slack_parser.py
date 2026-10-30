@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -509,6 +512,11 @@ class TestIngestEventForwards:
         assert '[from-id: U03DXM5L8KX] [display: "chopin"] Help…' in text
         # forwarded block comes before the cover note
         assert text.index("<forwarded_message>") < text.index("Help…")
+        source = fe._on_message.call_args.kwargs["source_event"]
+        assert source.user == "U03DXM5L8KX"
+        assert source.bot_id == ""
+        assert source.ts == CHOPIN_EVENT["ts"]
+        assert source.payload(replayed=False)["is_original_event"] is False
 
     async def test_bare_forward_without_cover_text(self):
         fe = _make_frontend()
@@ -1034,6 +1042,90 @@ class TestBotPolicy:
 
 
 class TestIngestEventTrustedBot:
+    @pytest.mark.parametrize("delivery", ["history", "failed_event"])
+    async def test_recovered_bot_event_never_claims_fresh_provenance(self, delivery):
+        fe = _make_frontend(allowed_bot_ids={"B07JPABE2"})
+        event = _bot_event(
+            text="<@UBOT> /gf-automation:run example-minutes 2026-10-30",
+            attachments=[],
+            ts=f"{time.time():.6f}",
+        )
+        if delivery == "history":
+            await fe._ingest_missed(event["channel"], "", [event])
+        else:
+            fe._failed_events.record_failure(event)
+            await fe._replay_failed_events()
+        fe._on_message.assert_awaited_once()
+        source = fe._on_message.call_args.kwargs["source_event"]
+        assert source.text == event["text"]
+        assert source.payload(replayed=False)["is_replayed"] is True
+        assert source.payload(replayed=False)["is_original_event"] is False
+
+    async def test_workflow_event_reaches_the_agent_prompt(self, tmp_path, monkeypatch):
+        from claude_on_the_fly import agent
+        from claude_on_the_fly import orchestrator as orch_mod
+
+        monkeypatch.setattr(orch_mod, "DATA_DIR", tmp_path)
+        fe = _make_frontend(allowed_bot_ids={"B07JPABE2"})
+        fe.notify_start = AsyncMock()
+        fe.notify_complete = AsyncMock()
+        fe.send_typing = AsyncMock()
+        fe.send = AsyncMock(return_value=[])
+        orch = orch_mod.Orchestrator(fe, "slack")
+        fe._on_message = orch.on_message
+        original = "<@UBOT> /gf-automation:run example-minutes 2026-10-30"
+        event = _bot_event(text=original, attachments=[])
+        run = AsyncMock(return_value=Response(body="prepared"))
+        with patch.object(agent, "run", run):
+            await fe._ingest_event(event)
+            await asyncio.gather(*orch._running.values())
+        metadata = json.loads(run.call_args.args[2].splitlines()[-2])
+        assert metadata["ts"] == event["ts"]
+        assert metadata["thread_ts"] == event["ts"]
+        assert metadata["text"] == original
+        assert metadata["bot_id"] == event["bot_id"]
+        assert metadata["is_original_event"] is True
+
+    async def test_workflow_handoff_retains_original_message_identity_and_text(self):
+        fe = _make_frontend(
+            allowed_bot_ids={"B07JPABE2"},
+            bot_policies={
+                "B07JPABE2": {
+                    "mode": "selective",
+                    "process_if": ["explicitly_mentions_agent"],
+                }
+            },
+        )
+        original = "<@UBOT> /gf-automation:run example-minutes 2026-10-30"
+        event = _bot_event(
+            text=original,
+            thread_ts="1781239400.000001",
+            user="UBOTUSER",
+            app_id="A1",
+            bot_profile={"app_id": "A_CONFLICT", "user_id": "U_CONFLICT"},
+            attachments=[],
+        )
+        await fe._ingest_event(event)
+
+        _, text = fe._on_message.call_args.args
+        assert "<@UBOT>" not in text  # Routing still strips the mention.
+        source = fe._on_message.call_args.kwargs["source_event"]
+        event["text"] = "later edit"
+        event["bot_profile"]["app_id"] = "later profile"
+        payload = source.payload(replayed=False)
+        assert payload["text"] == original
+        assert payload["ts"] == "1781239423.701139"
+        assert payload["thread_ts"] == "1781239400.000001"
+        assert payload["channel_id"] == "C07EBTHK6"
+        assert payload["bot_id"] == "B07JPABE2"
+        assert payload["user"] == "UBOTUSER"
+        assert payload["app_id"] == "A1"
+        assert payload["bot_profile"] == {
+            "app_id": "A_CONFLICT",
+            "user_id": "U_CONFLICT",
+        }
+        assert payload["is_original_event"] is True
+
     @staticmethod
     def _selective_policy(**overrides) -> dict[str, object]:
         policy: dict[str, object] = {
