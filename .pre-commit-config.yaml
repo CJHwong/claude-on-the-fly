@@ -80,6 +80,8 @@ repos:
 # files a run happens to touch, so `[tool.ty.src]` in pyproject decides the
 # scope instead of the hook's file list.
 -   repo: https://github.com/astral-sh/ty-pre-commit
-    rev: v0.0.64
+    rev: v0.0.95
     hooks:
     -   id: ty
+        # Update the wrapper's uv dependency while retaining the checked ty version.
+        entry: uv check --quiet --preview-features=check-command --ty-version=0.0.64
