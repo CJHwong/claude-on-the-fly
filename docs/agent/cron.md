@@ -225,6 +225,12 @@ Two different limits, and the vocabulary keeps them apart:
 The two must not be collapsed into one number. A producer that takes minutes is
 broken; an agent run that takes minutes is working.
 
+Both command runners start a dedicated session. On timeout they kill its whole
+process group and wait for the shell, following the agent CLI reaper's pattern
+without announcing an agent process. They kill the group even if the shell has
+already exited: background tools can still hold a producer's output pipes open.
+The failure alert retains the timeout detail for both entry kinds.
+
 ## What the cron tab shows as "running"
 
 An entry's own work is done the moment it enqueues, so the cron daemon cannot say whether the work it produced is running — the jobs worker owns that. The cron table answers it from the queue instead: `_running_by_entry` counts the in-flight rows whose `origin` names that entry, and the row's next-fire cell reads `running`, or `running (N)` for a producer entry with several items in flight. Only a claimed job counts; a queued one leaves the countdown, which is still the honest answer to when the entry next fires. The count depends on the producer stamping `{"kind": "cron", "entry": <name>}` on the origin (`_enqueue`) — drop that and the table goes quiet rather than wrong.
