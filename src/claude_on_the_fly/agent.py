@@ -14,7 +14,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import stat
 import tempfile
 import time
@@ -28,6 +27,7 @@ from typing import Protocol, cast
 import yaml
 
 from claude_on_the_fly import sandbox, settings
+from claude_on_the_fly.processes import kill_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -1298,8 +1298,8 @@ def _announce_process(
     The pgid is `proc.pid`, not `os.getpgid(proc.pid)`: with
     start_new_session=True the child calls setsid() and so leads a group whose
     id equals its own pid, which is knowable immediately and without racing the
-    child's setsid. (`_kill_process_tree` still asks the OS, because by then the
-    process may be gone and the answer matters more than the timing.)
+    child's setsid. The shared reaper uses that same group id even after the
+    leader exits, because its descendants can still be running.
 
     A listener that raises must not take the agent run down with it.
     """
@@ -1323,27 +1323,13 @@ async def _kill_process_tree(proc: asyncio.subprocess.Process) -> None:
     subprocesses it forked. A bare proc.kill() only hits the direct child and
     orphans the rest. Safe to call on an already-exited process.
 
-    The single un-announce point for `track_agent_process`, including the
-    already-exited early return — a process that ended on its own is just as
+    The single un-announce point for `track_agent_process`, including an
+    already-exited process — a process that ended on its own is just as
     finished as one this reaped, and a listener that never heard so would keep
     treating it as live.
     """
     try:
-        # Do not return merely because the leader already exited. A CLI can
-        # naturally exit while a tool child it spawned is still alive in the
-        # dedicated group; returning here is the orphaning bug this helper is
-        # responsible for preventing.
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            # The leader may have been reaped and the group may already be gone;
-            # a plain kill is still useful while it remains addressable.
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-        with contextlib.suppress(ProcessLookupError):
-            await proc.wait()
+        await kill_process_group(proc)
     finally:
         _announce_process(proc, "", running=False)
 
