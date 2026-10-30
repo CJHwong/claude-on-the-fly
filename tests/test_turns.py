@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from claude_on_the_fly import turns
+from claude_on_the_fly.source_event import SourceEvent
 from claude_on_the_fly.turns import (
     DISPATCHED,
     QUEUED,
@@ -40,6 +41,12 @@ def _turn(**kwargs) -> PendingTurn:
 
 
 class TestRecording:
+    def test_source_event_survives_a_new_reader(self, journal):
+        event = SourceEvent("slack", "C1", "1.5", "1.0", "<@U1> original")
+        journal.record(_turn(source_event=event))
+        replay, _ = TurnJournal(journal.path).take(now=1000.0)
+        assert replay[0].source_event == event
+
     def test_a_recorded_turn_survives_a_new_reader(self, journal, tmp_path):
         """The whole point: the record outlives the process that made it."""
         entry = _turn()

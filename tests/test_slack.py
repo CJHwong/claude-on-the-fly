@@ -7,6 +7,7 @@ import contextlib
 import logging
 import time
 from collections import deque
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -5692,6 +5693,9 @@ class TestContinueAction:
         _, replayed = frontend._on_message.call_args.args
         assert "do the thing" in replayed
         assert CONTINUE_COMMAND not in replayed
+        source = frontend._on_message.call_args.kwargs["source_event"]
+        assert source.text == "<@U_SELF> do the thing"
+        assert source.payload(replayed=False)["is_original_event"] is False
 
     async def test_tap_cancels_a_pending_notice(self, frontend):
         """A tap that lands while the notice is still waiting out its delay must
@@ -5807,6 +5811,11 @@ class TestReplayAction:
             "<@U_SELF> second",
         ]
         assert stored["text"] == "first"  # a copy was replayed, not the stored event
+        assert all(
+            c.kwargs["replayed"] is True
+            and c.kwargs["original_event"]["text"] in ("first", "second")
+            for c in frontend._ingest_event.await_args_list
+        )
         assert key not in frontend._untagged_msgs
         frontend._delete_ephemeral.assert_awaited_once_with(
             "https://hooks.slack.test/actions/2"
@@ -6944,6 +6953,16 @@ async def _ingest_pair(tmp_path: Path, plain: dict, broadcast: dict, **kwargs):
     return results
 
 
+def _assert_same_dispatch_with_preserved_subtype(plain, broadcast):
+    plain_call = plain._on_message.await_args
+    broadcast_call = broadcast._on_message.await_args
+    assert broadcast_call.args == plain_call.args
+    plain_source = plain_call.kwargs["source_event"]
+    broadcast_source = broadcast_call.kwargs["source_event"]
+    assert broadcast_source.subtype == "thread_broadcast"
+    assert replace(broadcast_source, subtype=plain_source.subtype) == plain_source
+
+
 async def _ingest_both(tmp_path: Path, user: str, text: str, **kwargs):
     """Ingest the plain and the broadcast form of one person's reply."""
     return await _ingest_pair(
@@ -6991,7 +7010,7 @@ class TestThreadBroadcastIsAThreadReply:
 
         plain._on_message.assert_awaited_once()
         broadcast._on_message.assert_awaited_once()
-        assert broadcast._on_message.await_args == plain._on_message.await_args
+        _assert_same_dispatch_with_preserved_subtype(plain, broadcast)
         chat_id, text = broadcast._on_message.await_args.args
         assert chat_id == _session_key("C1", "100.0")
         assert "please check" in text
@@ -7024,7 +7043,7 @@ class TestThreadBroadcastIsAThreadReply:
         )
         chat_id = _session_key("C1", "100.0")
         broadcast._on_message.assert_awaited_once()
-        assert broadcast._on_message.await_args == plain._on_message.await_args
+        _assert_same_dispatch_with_preserved_subtype(plain, broadcast)
         assert (
             broadcast._pending_reply_suppressed[chat_id]
             == plain._pending_reply_suppressed[chat_id]
@@ -7077,7 +7096,7 @@ class TestABotsThreadBroadcastIsABotReply:
         chat_id = _session_key("C1", "100.0")
         plain._on_message.assert_awaited_once()
         broadcast._on_message.assert_awaited_once()
-        assert broadcast._on_message.await_args == plain._on_message.await_args
+        _assert_same_dispatch_with_preserved_subtype(plain, broadcast)
         assert broadcast.sender_identity(chat_id) == "B_BOT"
         assert broadcast.sender_identity(chat_id) == plain.sender_identity(chat_id)
 
@@ -7135,7 +7154,7 @@ class TestABotsThreadBroadcastIsABotReply:
         chat_id = _session_key("C1", "100.0")
         plain_fe._on_message.assert_awaited_once()
         broadcast_fe._on_message.assert_awaited_once()
-        assert broadcast_fe._on_message.await_args == plain_fe._on_message.await_args
+        _assert_same_dispatch_with_preserved_subtype(plain_fe, broadcast_fe)
         assert broadcast_fe.sender_identity(chat_id) == "U_ALLOWED"
 
 
