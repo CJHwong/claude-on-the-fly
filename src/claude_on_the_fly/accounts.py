@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, cast
 from claude_on_the_fly import settings
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
     from claude_on_the_fly.agent import AgentProfile
 
@@ -52,7 +52,7 @@ def current() -> Account | None:
 
 
 @contextmanager
-def use(account: Account | None, *, mode: str | None = None) -> Iterator[None]:
+def use(account: Account | None, *, mode: str | None = None) -> Generator[None]:
     selected = replace(account, mode=mode) if account is not None and mode else account
     token = _CURRENT.set(selected)
     try:

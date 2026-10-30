@@ -15,7 +15,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from pathlib import Path
 
 from claude_on_the_fly import approvals, broker, codex_auth, commands, egress, sandbox
@@ -92,7 +92,7 @@ class JobBrokers:
     @contextlib.asynccontextmanager
     async def for_job(
         self, workspace: Path, key: str, model_env: Mapping[str, str] | None = None
-    ) -> AsyncIterator[dict[str, str]]:
+    ) -> AsyncGenerator[dict[str, str]]:
         """The env one job's agent needs, torn down when the job ends.
 
         `model_env` names the job's model server (`sandbox.model_endpoint_env`),
