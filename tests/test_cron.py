@@ -4,11 +4,17 @@ that decide what a fire actually hands to the queue."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import re
+import shlex
+import signal
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import yaml
@@ -2134,6 +2140,134 @@ class TestRunCommand:
             )
         assert len(out) == 32
         assert "truncating to 32" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("runner", ["side_effect", "producer", "exited_producer"])
+async def test_cron_timeout_reaps_background_descendants_and_alerts_with_note(
+    tmp_path: Path, monkeypatch, process_gone, runner: str
+) -> None:
+    """A timeout must reach background tools, including after the shell exits."""
+    pid_file = tmp_path / "descendants.json"
+    script = (
+        "import json, os, subprocess, sys, time; from pathlib import Path; "
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(60)']); "
+        f"Path({str(pid_file)!r}).write_text(json.dumps([os.getpid(), child.pid])); "
+        "time.sleep(60)"
+    )
+    background = shlex.join([sys.executable, "-c", script])
+    command = background + (" & exit 0" if runner == "exited_producer" else " & wait")
+    spawned = []
+    real_spawn = asyncio.create_subprocess_shell
+
+    async def spawn(*args, **kwargs):
+        proc = await real_spawn(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", spawn)
+    monkeypatch.setattr(cron_mod, "log_path", lambda _name: tmp_path / "out.log")
+    sink = _RecordingAlertSink()
+    queue = FakeQueue()
+    cron = daemon(tmp_path, cfg(tmp_path), queue, alert_sink=sink)
+    if runner == "side_effect":
+        entry = CronEntry(name="tree", command=command, timeout=1)
+        task = asyncio.create_task(cron._run_side_effect(entry, STAMP))
+    else:
+        entry = _producer_entry(command=command, producer_timeout=1)
+        task = asyncio.create_task(cron._fire_producer(entry, STAMP))
+    descendants = []
+    try:
+        deadline = time.monotonic() + 5
+        while not pid_file.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert pid_file.exists(), "background tools did not start"
+        descendants = json.loads(pid_file.read_text())
+        assert len(descendants) == 2
+        for pid in descendants:
+            os.kill(pid, 0)
+        await asyncio.wait_for(task, timeout=5)
+        for pid in descendants:
+            assert await process_gone(pid, timeout=1), (
+                "descendant survived cron timeout"
+            )
+        assert len(sink.calls) == 1
+        origin, result = sink.calls[0]
+        assert origin == {"kind": "cron", "entry": entry.name}
+        assert result.ok is False
+        assert "timed out after 1s" in result.text
+        assert queue.jobs == []
+    finally:
+        # A regression must fail without leaking the background tools it found.
+        if not descendants and pid_file.exists():
+            descendants = json.loads(pid_file.read_text())
+        for pid in reversed(descendants):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        for proc in spawned:
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            await task
+
+
+@pytest.mark.parametrize(
+    "group_error,kill_error,wait_error",
+    [
+        (None, None, None),
+        (ProcessLookupError, None, None),
+        (PermissionError, None, None),
+        (OSError, ProcessLookupError, None),
+        (None, None, ProcessLookupError),
+    ],
+)
+async def test_command_group_cleanup_tolerates_exit_races_and_kill_fallback(
+    monkeypatch, group_error, kill_error, wait_error
+) -> None:
+    proc = Mock()
+    proc.pid = 4242
+    proc.returncode = 0  # An exited leader does not imply its group is empty.
+    proc.kill.side_effect = kill_error
+    proc.wait = AsyncMock(side_effect=wait_error)
+    kill_group = Mock(side_effect=group_error)
+    monkeypatch.setattr(cron_mod.os, "killpg", kill_group)
+
+    await cron_mod._kill_command_group(proc)
+
+    kill_group.assert_called_once_with(proc.pid, signal.SIGKILL)
+    proc.wait.assert_awaited_once()
+    if group_error in (PermissionError, OSError):
+        proc.kill.assert_called_once()
+    else:
+        proc.kill.assert_not_called()
+
+
+async def test_timeout_still_alerts_when_shell_wins_exit_race(tmp_path, monkeypatch):
+    proc = Mock()
+    proc.pid = 4242
+    proc.returncode = 0
+    proc.wait = AsyncMock(side_effect=[TimeoutError, 0])
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_shell", AsyncMock(return_value=proc)
+    )
+    kill_group = Mock()
+    monkeypatch.setattr(cron_mod.os, "killpg", kill_group)
+    monkeypatch.setattr(cron_mod, "log_path", lambda _name: tmp_path / "out.log")
+    sink = _RecordingAlertSink()
+    cron = daemon(tmp_path, cfg(tmp_path), alert_sink=sink)
+
+    await cron._run_side_effect(
+        CronEntry(name="race", command="true", timeout=1), STAMP
+    )
+
+    kill_group.assert_called_once_with(proc.pid, signal.SIGKILL)
+    assert len(sink.calls) == 1
+    assert sink.calls[0][1].ok is False
+    assert "timed out after 1s" in sink.calls[0][1].text
 
 
 class TestRootKeyRename:

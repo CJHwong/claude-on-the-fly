@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import sys
 import time
 from collections.abc import Callable, Coroutine, Iterable
@@ -869,6 +870,20 @@ def _with_scheduled_at(scheduled_at: str) -> dict[str, str]:
     return {**os.environ, SCHEDULED_AT_ENV: scheduled_at}
 
 
+async def _kill_command_group(proc: asyncio.subprocess.Process) -> None:
+    """Reap a command's dedicated group, even after its shell has exited."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        # Match the agent CLI reaper's fallback without its process announcements.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+    with contextlib.suppress(ProcessLookupError):
+        await proc.wait()
+
+
 class CronDaemon:
     """Fires due entries and enqueues the work they produce."""
 
@@ -1245,7 +1260,8 @@ class CronDaemon:
                 rc,
                 f": {stdout.strip()[:400]}" if stdout.strip() else "",
             )
-            await self._alert_failure(entry, f"producer exited {rc}")
+            note = f": {stdout.strip()}" if rc is None else ""
+            await self._alert_failure(entry, f"producer exited {rc}{note}")
             return
         items = parse_items(stdout, entry.name)
         if not items:
@@ -1409,13 +1425,13 @@ class CronDaemon:
                     stdout=handle,
                     stderr=asyncio.subprocess.STDOUT,
                     env=_with_scheduled_at(scheduled_at),
+                    start_new_session=True,
                 )
                 try:
                     rc = await asyncio.wait_for(proc.wait(), timeout=entry.timeout)
                     note = ""
                 except TimeoutError:
-                    proc.kill()
-                    await proc.wait()
+                    await _kill_command_group(proc)
                     rc = proc.returncode
                     note = f" (timed out after {entry.timeout}s)"
         except asyncio.CancelledError:
@@ -1429,7 +1445,7 @@ class CronDaemon:
         append_log(
             entry.name, f"=== done exit={rc} duration={elapsed:.1f}s{note} ===\n"
         )
-        if rc != 0:
+        if rc != 0 or note:
             await self._alert_failure(entry, f"command exited {rc}{note}")
 
     async def _alert_failure(self, entry: CronEntry, text: str) -> None:
@@ -1458,12 +1474,12 @@ class CronDaemon:
             stdout=pipe,
             stderr=asyncio.subprocess.PIPE,
             env=_with_scheduled_at(scheduled_at),
+            start_new_session=True,
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await _kill_command_group(proc)
             return f"timed out after {timeout}s", None
         if err:
             # A producer's stderr is where its own diagnostics go, and swallowing
