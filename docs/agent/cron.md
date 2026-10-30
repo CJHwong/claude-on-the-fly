@@ -226,8 +226,8 @@ The two must not be collapsed into one number. A producer that takes minutes is
 broken; an agent run that takes minutes is working.
 
 Both command runners start a dedicated session. On timeout they kill its whole
-process group and wait for the shell, following the agent CLI reaper's pattern
-without announcing an agent process. They kill the group even if the shell has
+process group and wait for the shell through the same helper as the agent CLI
+reaper, without announcing an agent process. They kill the group even if the shell has
 already exited: background tools can still hold a producer's output pipes open.
 The failure alert retains the timeout detail for both entry kinds.
 
@@ -274,6 +274,9 @@ WARNING, rather than telling anybody. Tasks are named after their entry
 (`_spawn`) purely so that log line and `heartbeat_extra`'s `running_commands`
 can identify them; the task object carries no other route back to the entry.
 Producers are in that set too, so a stop cuts a poll in flight and says so.
+Both runners reap their dedicated process groups before re-raising cancellation.
+The shared reaper shields its wait and completes it even if shutdown cancels the
+task again; only the agent wrapper announces an agent process ending.
 
 `heartbeat_extra` publishes `running_commands` for one reader:
 `supervisor.pending_work`, which says what a stop will cancel *before* it signals.

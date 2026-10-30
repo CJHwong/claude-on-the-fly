@@ -2142,20 +2142,28 @@ class TestRunCommand:
         assert "truncating to 32" in "\n".join(r.getMessage() for r in caplog.records)
 
 
-@pytest.mark.parametrize("runner", ["side_effect", "producer", "exited_producer"])
-async def test_cron_timeout_reaps_background_descendants_and_alerts_with_note(
-    tmp_path: Path, monkeypatch, process_gone, runner: str
-) -> None:
-    """A timeout must reach background tools, including after the shell exits."""
+@pytest.fixture
+def background_command(tmp_path: Path):
+    """A shell background child with its own child, recording both PIDs atomically."""
     pid_file = tmp_path / "descendants.json"
     script = (
         "import json, os, subprocess, sys, time; from pathlib import Path; "
         "child = subprocess.Popen([sys.executable, '-c', "
         "'import time; time.sleep(60)']); "
-        f"Path({str(pid_file)!r}).write_text(json.dumps([os.getpid(), child.pid])); "
-        "time.sleep(60)"
+        f"target = Path({str(pid_file)!r}); "
+        "temporary = target.with_suffix('.tmp'); "
+        "temporary.write_text(json.dumps([os.getpid(), child.pid])); "
+        "temporary.replace(target); time.sleep(60)"
     )
-    background = shlex.join([sys.executable, "-c", script])
+    return pid_file, shlex.join([sys.executable, "-c", script])
+
+
+@pytest.mark.parametrize("runner", ["side_effect", "producer", "exited_producer"])
+async def test_cron_timeout_reaps_background_descendants_and_alerts_with_note(
+    tmp_path: Path, monkeypatch, process_gone, runner: str, background_command
+) -> None:
+    """A timeout must reach background tools, including after the shell exits."""
+    pid_file, background = background_command
     command = background + (" & exit 0" if runner == "exited_producer" else " & wait")
     spawned = []
     real_spawn = asyncio.create_subprocess_shell
@@ -2951,3 +2959,98 @@ class TestCatchUpConfig:
         }
         with pytest.raises(ValueError, match="'catch_up' needs 'cron'"):
             load_config(cfg(tmp_path, entry))
+
+
+@pytest.mark.parametrize("runner", ["side_effect", "producer", "exited_producer"])
+@pytest.mark.parametrize("shutdown", ["cancel", "stop", "cancel_again"])
+async def test_cron_shutdown_reaps_background_descendants_before_cancellation_completes(
+    tmp_path: Path, monkeypatch, process_gone, background_command, runner, shutdown
+) -> None:
+    pid_file, background = background_command
+    command = background + (" & exit 0" if runner == "exited_producer" else " & wait")
+    spawned = []
+    real_spawn = asyncio.create_subprocess_shell
+
+    async def spawn(*args, **kwargs):
+        proc = await real_spawn(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", spawn)
+    monkeypatch.setattr(cron_mod, "log_path", lambda _name: tmp_path / "out.log")
+    sink = _RecordingAlertSink()
+    queue = FakeQueue()
+    cron = daemon(tmp_path, cfg(tmp_path), queue, alert_sink=sink)
+    if runner == "side_effect":
+        entry = CronEntry(name="tree", command=command, timeout=60)
+        cron._spawn_command(entry, STAMP)
+    else:
+        entry = _producer_entry(command=command, producer_timeout=60)
+        cron._spawn_producer(entry, STAMP)
+    task = next(iter(cron._command_tasks))
+    descendants = []
+    release_cleanup = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+    try:
+        deadline = time.monotonic() + 5
+        while not pid_file.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert pid_file.exists(), "background tools did not start"
+        descendants = json.loads(pid_file.read_text())
+        assert len(descendants) == 2
+        for pid in descendants:
+            os.kill(pid, 0)
+        if shutdown == "cancel_again":
+            # Hold the real reaper's wait after the shell exits, so cancellation
+            # during cleanup is deterministic rather than a scheduling race.
+            real_wait = spawned[0].wait
+
+            async def held_wait():
+                rc = await real_wait()
+                cleanup_entered.set()
+                await release_cleanup.wait()
+                cleanup_completed.set()
+                return rc
+
+            monkeypatch.setattr(spawned[0], "wait", held_wait)
+            task.cancel()
+            await asyncio.wait_for(cleanup_entered.wait(), timeout=5)
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done(), "a second cancel skipped the reaper wait"
+            release_cleanup.set()
+        elif shutdown == "stop":
+            await asyncio.wait_for(cron.stop(), timeout=5)
+        else:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert task.cancelled()
+        if shutdown == "cancel_again":
+            assert cleanup_completed.is_set()
+        for pid in descendants:
+            assert await process_gone(pid, timeout=1), (
+                "descendant survived cron shutdown"
+            )
+        assert sink.calls == []  # Shutdown is logged, not alerted as a failure.
+        assert queue.jobs == []
+        if runner == "side_effect":
+            assert "cancelled during shutdown" in (tmp_path / "out.log").read_text()
+    finally:
+        release_cleanup.set()
+        if not descendants and pid_file.exists():
+            descendants = json.loads(pid_file.read_text())
+        for pid in reversed(descendants):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        for proc in spawned:
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            await task

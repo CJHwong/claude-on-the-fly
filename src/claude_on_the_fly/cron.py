@@ -55,6 +55,7 @@ from claude_on_the_fly.jobs.key_state import (
     KeyStateStore,
     fingerprint,
 )
+from claude_on_the_fly.processes import kill_process_group as _kill_command_group
 
 logger = logging.getLogger(__name__)
 
@@ -870,20 +871,6 @@ def _with_scheduled_at(scheduled_at: str) -> dict[str, str]:
     return {**os.environ, SCHEDULED_AT_ENV: scheduled_at}
 
 
-async def _kill_command_group(proc: asyncio.subprocess.Process) -> None:
-    """Reap a command's dedicated group, even after its shell has exited."""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        # Match the agent CLI reaper's fallback without its process announcements.
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-    with contextlib.suppress(ProcessLookupError):
-        await proc.wait()
-
-
 class CronDaemon:
     """Fires due entries and enqueues the work they produce."""
 
@@ -1434,6 +1421,9 @@ class CronDaemon:
                     await _kill_command_group(proc)
                     rc = proc.returncode
                     note = f" (timed out after {entry.timeout}s)"
+                except asyncio.CancelledError:
+                    await _kill_command_group(proc)
+                    raise
         except asyncio.CancelledError:
             append_log(entry.name, "*** cancelled during shutdown ***\n")
             raise
@@ -1481,6 +1471,9 @@ class CronDaemon:
         except TimeoutError:
             await _kill_command_group(proc)
             return f"timed out after {timeout}s", None
+        except asyncio.CancelledError:
+            await _kill_command_group(proc)
+            raise
         if err:
             # A producer's stderr is where its own diagnostics go, and swallowing
             # them is what makes "it just stopped finding tickets" unanswerable.
@@ -1533,7 +1526,6 @@ class CronDaemon:
 
 def main() -> int:
     import argparse
-    import signal
 
     from claude_on_the_fly import envfile
     from claude_on_the_fly.heartbeat import (
