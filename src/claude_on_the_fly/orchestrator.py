@@ -63,6 +63,7 @@ from claude_on_the_fly.jobs.alerts import ALERT_COOLDOWN_S, build_alert_sink
 from claude_on_the_fly.jobs.core import Result
 from claude_on_the_fly.jobs.orphans import ProcessLedger
 from claude_on_the_fly.protocol import Frontend
+from claude_on_the_fly.source_event import SourceEvent, source_event_note
 from claude_on_the_fly.turns import PendingTurn, TurnJournal, new_turn_id
 
 logger = logging.getLogger(__name__)
@@ -365,6 +366,8 @@ class Turn:
     # but it says nothing: the chat went quiet, and a reply out of nowhere
     # would read as the agent talking to itself.
     background: bool = False
+    source_event: SourceEvent | None = None
+    replayed: bool = False
 
 
 @dataclass(frozen=True)
@@ -747,7 +750,9 @@ class Orchestrator:
         await asyncio.gather(task, return_exceptions=True)
         return True
 
-    async def on_message(self, chat_id: int, text: str) -> None:
+    async def on_message(
+        self, chat_id: int, text: str, *, source_event: SourceEvent | None = None
+    ) -> None:
         logger.debug("on_message: chat_id=%s text=%s", chat_id, logs.redact(text))
         if self._due_for_compaction(chat_id):
             # Ahead of the message, not during the idle window before it. An idle
@@ -758,7 +763,7 @@ class Orchestrator:
             # the cache lifetime, where the same pass reads the context cached.
             logger.info("on_message: chat_id=%s auto-compacting first", chat_id)
             await self.on_compact(chat_id)
-        await self._enqueue(chat_id, Turn(text))
+        await self._enqueue(chat_id, Turn(text, source_event=source_event))
 
     async def on_compact(self, chat_id: int) -> None:
         """Queue a compaction for this chat. Runs in FIFO order like any turn."""
@@ -911,6 +916,7 @@ class Orchestrator:
             turn_id=new_turn_id(),
             recorded_at=time.time(),
             replays=replays,
+            source_event=turn.source_event,
         )
         self._journal.record(entry)
         return replace(turn, journal_id=entry.turn_id)
@@ -1239,6 +1245,10 @@ class Orchestrator:
                     prompt = f"{prompt}\n\n{agent.outbox_note(outbox)}"
                 if suggestions:
                     prompt = f"{prompt}\n\n{SUGGESTIONS_TEMPLATE}"
+                if self._platform == "slack":
+                    # Last, and tied to the queued turn, not session_facts:
+                    # another message can arrive while this one is waiting.
+                    prompt = f"{prompt}\n\n{source_event_note(turn.source_event, replayed=turn.replayed)}"
                 # The backend's nudge retry (an empty or block-only reply)
                 # carries the suggestions instruction too, so the retried
                 # answer comes back with working buttons rather than a bare
@@ -1853,6 +1863,8 @@ class Orchestrator:
                     _resume_prompt(entry),
                     compact=entry.compact,
                     journal_id=entry.turn_id,
+                    source_event=entry.source_event,
+                    replayed=True,
                 ),
                 replays=entry.replays,
             )
