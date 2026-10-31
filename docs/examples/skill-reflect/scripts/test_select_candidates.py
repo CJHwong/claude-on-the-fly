@@ -32,6 +32,27 @@ LOCAL_SKILL = f"{SOUL}/skills/agent-ops/skills/check-ai-usage/SKILL.md"
 CONFIG = sel.Config(SOUL, ("team-market",), ("twg", ".system/"))
 
 
+def test_late_explicit_request_survives_full_context_budget():
+    session = sel.Session("fixture", "", "", "slack", "fixture")
+    session.timeline = [
+        sel.Item("user", "correction " + "x" * 900, "U1") for _ in range(40)
+    ]
+    session.signals = [{"at": i, "type": "correction"} for i in range(30)]
+    session.timeline.append(
+        sel.Item(
+            "user",
+            "prefix " * 200 + "Remember this: preserve the final owner decision.",
+            "U1",
+        )
+    )
+    session.signals.append({"at": 40, "type": "explicit_ask"})
+    excerpts = sel.excerpts(session)
+    assert "Remember this: preserve the final owner decision." in "\n".join(
+        e["text"] for e in excerpts
+    )
+    assert sum(len(e["text"]) for e in excerpts) <= sel.EXCERPT_CHARS
+
+
 def user(text: str, who: str = "U1") -> dict:
     body = f'[from-id: {who}] [display: "p"] {text}\n\n<cotf-outbox>System instruction</cotf-outbox>'
     return {
