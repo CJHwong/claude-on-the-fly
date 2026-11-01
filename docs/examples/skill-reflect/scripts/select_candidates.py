@@ -527,6 +527,23 @@ def excerpts(session: Session) -> list[dict]:
             continue
         merged.append([start, end, {kind}])
     out, budget = [], EXCERPT_CHARS
+    # Preserve the actual requests before older context can exhaust the budget.
+    asks = sorted(
+        {signal["at"] for signal in session.signals if signal["type"] == "explicit_ask"}
+    )
+    for position, index in enumerate(asks):
+        item = session.timeline[index]
+        match = EXPLICIT_ASK.search(item.text)
+        if match is None:
+            continue
+        quota = min(TEXT_CHARS["user"], budget // (len(asks) - position))
+        label = f"[user {item.speaker}] "
+        if quota < len(label) + len(match.group()):
+            continue
+        start = max(0, match.start() - 80)
+        text = label + item.text[start : start + quota - len(label)]
+        out.append({"signals": ["explicit_ask"], "text": text})
+        budget -= len(text)
     for start, end, kinds in merged:
         lines = [clip(item) for item in session.timeline[start:end]]
         text = "\n".join(lines)
