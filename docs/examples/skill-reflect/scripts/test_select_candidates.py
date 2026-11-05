@@ -748,3 +748,77 @@ def test_bare_skill_names_resolve_to_the_inventory():
         == "content:read-rss-feed"
     )
     assert sel.inventory_name("dup", inventory) == "dup"  # ambiguous: left as called
+
+
+def test_pending_mechanisms_load_evidence_before_the_cursor(world, tmp_path):
+    add_thread(
+        world,
+        "old-lesson",
+        world["ws"] / "slack/dm/U1",
+        [agent("Done."), user("No, read linked issues first.")],
+    )
+    history = tmp_path / "history"
+    history.mkdir()
+    (history / "candidates.json").write_text(json.dumps(run_select(world)))
+    world["con"].execute("update threads set updated_at = 1")
+    world["con"].commit()
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "last_run_at": "2026-10-01T00:00:00+00:00",
+                "mechanisms": {
+                    "linked-issues": {
+                        "task_class": "Ticket creation",
+                        "mechanism": "Read linked issues before choosing a parent.",
+                        "status": "pending",
+                        "reason": "One session.",
+                        "evidence": ["old-lesson"],
+                        "evidence_runs": {"old-lesson": str(history)},
+                    }
+                },
+            }
+        )
+    )
+    selected = run_select(world, "--state", str(state))
+    assert selected["candidates"] == []
+    assert selected["archived_candidates"][0]["thread_id"] == "old-lesson"
+    assert selected["mechanism_archive"][0]["id"] == "linked-issues"
+    assert selected["counts"]["pending_mechanisms"] == 1
+
+
+def test_missing_archived_evidence_stops_the_review(world, tmp_path):
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "mechanisms": {
+                    "linked-issues": {
+                        "status": "pending",
+                        "evidence": ["old-lesson"],
+                        "evidence_runs": {"old-lesson": str(tmp_path / "missing")},
+                    }
+                }
+            }
+        )
+    )
+    with pytest.raises(SystemExit, match="archived evidence"):
+        run_select(world, "--state", str(state))
+
+
+def test_selection_does_not_overwrite_an_existing_run(world):
+    arguments = [
+        "--out",
+        str(world["tmp"] / "candidates.json"),
+        "--codex-home",
+        str(world["codex"]),
+        "--claude-home",
+        str(world["claude"]),
+        "--cotf-home",
+        str(world["cotf"]),
+    ]
+    assert sel.main(arguments) == 0
+    original = (world["tmp"] / "candidates.json").read_bytes()
+    with pytest.raises(SystemExit, match="already exists"):
+        sel.main(arguments)
+    assert (world["tmp"] / "candidates.json").read_bytes() == original

@@ -48,6 +48,9 @@ The skill's full suite can cost more than the change is worth. A small focused s
 ## 4. Record and reply
 
 1. Update `~/.claude-on-the-fly/state/skill-reflect/state.json`: set each proposal's status to `applied`, `rejected` (with the approver's reason), or `stale`.
+   If the proposal has `mechanism_id`, update that archive entry to the same status.
+   If the proposal is stale, keep its mechanism `pending` for a new review.
+   Retain its evidence IDs and source run paths after any decision.
 2. Reply once in the thread. For each proposal number, give the result: the commit, the draft PR link, `rejected`, or `stale` with the reason.
 
 For an applied local patch, retain `versions` (or the older `evaluation`) and record `applied_version`, `applied_at`, and the commit.

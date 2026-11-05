@@ -295,3 +295,143 @@ def test_local_patch_stays_inside_run_directory(run_dir, local_patch, location):
     out = finalize(run_dir, [{**local_patch, "patch_file": location}])
     assert out["kept"] == []
     assert "run directory" in out["dropped"][0]["reason"]
+
+
+def mechanism(evidence):
+    return {
+        "id": "linked-issues",
+        "task_class": "Ticket creation",
+        "mechanism": "Read linked issues before choosing a parent.",
+        "status": "pending",
+        "reason": "Needs more evidence.",
+        "evidence": evidence,
+    }
+
+
+def test_weak_mechanism_survives_and_later_becomes_a_proposal(run_dir, tmp_path):
+    candidates = json.loads((run_dir / "candidates.json").read_text())
+    candidates["candidates"] = candidates["candidates"][:1]
+    candidates["mechanism_archive"] = []
+    candidates["cron_recoveries"] = []
+    (run_dir / "candidates.json").write_text(json.dumps(candidates))
+    (run_dir / "proposals.json").write_text(
+        json.dumps(
+            {
+                "proposals": [],
+                "mechanisms": [mechanism(["t1"])],
+            }
+        )
+    )
+    state = tmp_path / "state.json"
+    fin.main(["--run-dir", str(run_dir), "--mode", "live", "--state", str(state)])
+    saved = fin.record(run_dir, state, "first-digest")
+    pending = saved["mechanisms"]["linked-issues"]
+    assert pending["status"] == "pending"
+    assert pending["evidence"] == ["t1"]
+    assert pending["evidence_runs"] == {"t1": str(run_dir.resolve())}
+    assert "excerpts" not in pending
+
+    later = tmp_path / "later"
+    (later / "patches").mkdir(parents=True)
+    (later / "patches/01.md").write_text("Read linked issues first.")
+    candidates["archived_candidates"] = candidates["candidates"]
+    candidates["candidates"] = [CANDIDATES["candidates"][1]]
+    candidates["mechanism_archive"] = [{"id": "linked-issues", **pending}]
+    (later / "candidates.json").write_text(json.dumps(candidates))
+    (later / "proposals.json").write_text(
+        json.dumps(
+            {
+                "proposals": [proposal(mechanism_id="linked-issues")],
+                "mechanisms": [mechanism(["t2"])],
+            }
+        )
+    )
+    fin.main(["--run-dir", str(later), "--mode", "live", "--state", str(state)])
+    final = json.loads((later / "proposals.final.json").read_text())
+    assert final["kept"][0]["sessions"] == 2
+    saved = fin.record(later, state, "second-digest")
+    promoted = saved["mechanisms"]["linked-issues"]
+    assert promoted["status"] == "proposed"
+    assert promoted["evidence"] == ["t1", "t2"]
+    assert promoted["evidence_runs"]["t1"] == str(run_dir.resolve())
+    assert promoted["evidence_runs"]["t2"] == str(later.resolve())
+
+
+def test_archive_requires_an_outcome_for_each_reviewed_session(run_dir):
+    candidates = json.loads((run_dir / "candidates.json").read_text())
+    candidates["mechanism_archive"] = []
+    (run_dir / "candidates.json").write_text(json.dumps(candidates))
+    (run_dir / "proposals.json").write_text(
+        json.dumps({"proposals": [], "mechanisms": []})
+    )
+    with pytest.raises(SystemExit, match="unreviewed evidence"):
+        fin.main(["--run-dir", str(run_dir), "--mode", "live"])
+
+
+def test_repeated_record_updates_the_sent_digest(run_dir, tmp_path):
+    finalize(run_dir, [proposal()])
+    state = tmp_path / "state.json"
+    fin.record(run_dir, state, "first-digest")
+    saved = fin.record(run_dir, state, "second-digest")
+    assert next(iter(saved["proposals"].values()))["permalink"] == "second-digest"
+
+
+def test_archive_mode_saves_weak_evidence_without_advancing_the_cursor(
+    run_dir, tmp_path
+):
+    candidates = json.loads((run_dir / "candidates.json").read_text())
+    candidates["candidates"] = candidates["candidates"][:1]
+    candidates["mechanism_archive"] = []
+    candidates["cron_recoveries"] = []
+    (run_dir / "candidates.json").write_text(json.dumps(candidates))
+    (run_dir / "proposals.json").write_text(
+        json.dumps(
+            {
+                "proposals": [],
+                "mechanisms": [mechanism(["t1"])],
+            }
+        )
+    )
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"last_run_at": "2026-09-01", "proposals": {}}))
+    fin.main(["--run-dir", str(run_dir), "--mode", "archive", "--state", str(state)])
+    saved = json.loads(state.read_text())
+    assert saved["last_run_at"] == "2026-09-01"
+    assert saved["proposals"] == {}
+    assert saved["mechanisms"]["linked-issues"]["status"] == "pending"
+    assert saved["mechanisms"]["linked-issues"]["evidence_runs"] == {
+        "t1": str(run_dir.resolve())
+    }
+
+
+def test_archive_mode_keeps_eligible_drafts_pending(run_dir, tmp_path):
+    candidates = json.loads((run_dir / "candidates.json").read_text())
+    candidates["candidates"] = candidates["candidates"][:2]
+    candidates["mechanism_archive"] = []
+    candidates["cron_recoveries"] = []
+    (run_dir / "candidates.json").write_text(json.dumps(candidates))
+    (run_dir / "proposals.json").write_text(
+        json.dumps(
+            {
+                "proposals": [proposal(mechanism_id="linked-issues")],
+                "mechanisms": [mechanism(["t1", "t2"])],
+            }
+        )
+    )
+    state = tmp_path / "archive-state.json"
+    fin.main(["--run-dir", str(run_dir), "--mode", "archive", "--state", str(state)])
+    saved = json.loads(state.read_text())
+    assert "last_run_at" not in saved
+    assert saved["proposals"] == {}
+    assert saved["mechanisms"]["linked-issues"]["status"] == "pending"
+    final = json.loads((run_dir / "proposals.final.json").read_text())
+    assert final["mechanisms"][0]["status"] == "proposed"
+
+
+def test_posted_runs_cannot_be_rendered_again(run_dir):
+    finalize(run_dir, [proposal()])
+    digest = (run_dir / "digest.md").read_bytes()
+    (run_dir / "posted.json").write_text("{}")
+    with pytest.raises(SystemExit, match="this run was posted"):
+        fin.main(["--run-dir", str(run_dir), "--mode", "live"])
+    assert (run_dir / "digest.md").read_bytes() == digest

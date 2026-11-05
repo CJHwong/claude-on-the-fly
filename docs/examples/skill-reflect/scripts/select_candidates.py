@@ -681,6 +681,53 @@ def load_cursor(state: Path | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def archived_evidence(identifier: str, directory: str, cache: dict) -> tuple[str, dict]:
+    if not directory:
+        raise SystemExit(f"error: archived evidence {identifier} has no source run")
+    if directory not in cache:
+        try:
+            cache[directory] = json.loads(
+                (Path(directory) / "candidates.json").read_text()
+            )
+        except (OSError, ValueError) as error:
+            raise SystemExit(
+                f"error: archived evidence {identifier}: {error}"
+            ) from error
+    history = cache[directory]
+    if identifier.startswith("job:"):
+        records = history.get("cron_recoveries", []) + history.get(
+            "archived_cron_recoveries", []
+        )
+        matches = [record for record in records if f"job:{record['job']}" == identifier]
+        kind = "job"
+    else:
+        records = history.get("candidates", []) + history.get("archived_candidates", [])
+        matches = [record for record in records if record["thread_id"] == identifier]
+        kind = "session"
+    if not matches:
+        raise SystemExit(
+            f"error: archived evidence {identifier} is missing from {directory}"
+        )
+    return kind, matches[0]
+
+
+def pending_archive(state: Path | None) -> tuple[list[dict], list[dict], list[dict]]:
+    saved = json.loads(state.read_text()) if state and state.exists() else {}
+    mechanisms = [
+        {"id": identifier, **entry}
+        for identifier, entry in saved.get("mechanisms", {}).items()
+        if entry.get("status") == "pending"
+    ]
+    sessions, jobs, cache = {}, {}, {}
+    for mechanism in mechanisms:
+        for identifier in mechanism["evidence"]:
+            directory = mechanism.get("evidence_runs", {}).get(identifier, "")
+            kind, record = archived_evidence(identifier, directory, cache)
+            target = jobs if kind == "job" else sessions
+            target[identifier] = record
+    return mechanisms, list(sessions.values()), list(jobs.values())
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -706,6 +753,7 @@ def run(args: argparse.Namespace) -> dict:
     config = load_config(args.config or args.cotf_home / "skill-reflect.yaml")
     now = datetime.now(UTC)
     since = load_cursor(args.state) or now - timedelta(days=args.days)
+    mechanisms, archived_sessions, archived_jobs = pending_archive(args.state)
     workspaces = args.cotf_home / "workspaces"
     source_files: dict[str, str] = {}
     inventory = skill_inventory(config, args.codex_home, args.claude_home, source_files)
@@ -737,8 +785,13 @@ def run(args: argparse.Namespace) -> dict:
             "signals": dict(signal_totals),
             "unreadable_transcripts": errors,
             "candidates": len(ranked),
+            "pending_mechanisms": len(mechanisms),
+            "archived_sessions": len(archived_sessions),
         },
         "candidates": [candidate(s) for s in ranked],
+        "mechanism_archive": mechanisms,
+        "archived_candidates": archived_sessions,
+        "archived_cron_recoveries": archived_jobs,
         "cron_recoveries": cron_recoveries(args.cotf_home / "logs", since),
         "skill_usage": usage_report(sessions, inventory, source_files),
     }
@@ -768,9 +821,19 @@ def candidate(session: Session) -> dict:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.out.exists():
+        raise SystemExit(
+            f"error: {args.out} already exists; create a new run directory"
+        )
     result = run(args)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(result, ensure_ascii=False, indent=1))
+    try:
+        with args.out.open("x") as output:
+            output.write(json.dumps(result, ensure_ascii=False, indent=1))
+    except FileExistsError as error:
+        raise SystemExit(
+            f"error: {args.out} already exists; create a new run directory"
+        ) from error
     print(json.dumps(result["counts"], ensure_ascii=False))
     return 0
 

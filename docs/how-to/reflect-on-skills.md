@@ -27,6 +27,22 @@ new_skill_dir: skills
 
 The skill keeps its run files and state under `~/.claude-on-the-fly/state/skill-reflect/`. The run files hold DM excerpts, so they stay out of the soul repo.
 
+The local archive retains reviewed mechanisms that do not yet justify a skill.
+For example, week one can record a useful lesson from one session.
+A later week can add another session and meet the proposal threshold.
+The selector reloads the earlier evidence before the agent checks that threshold.
+The approver still decides whether to apply the proposal.
+
+`state.json` holds the mechanism summaries, decisions, evidence IDs, and source run paths.
+Each run keeps its selected excerpts in `candidates.json` and its reviewed outcomes in `proposals.final.json`.
+Keep those run directories. The archive needs them to reload evidence.
+Each live run uses a unique directory, so another run on the same day cannot overwrite it.
+
+The archive covers evidence selected for review. It does not copy all raw transcripts.
+The selector defaults to 40 candidates and limits each conversation or job to two sessions.
+Discarded mechanisms retain their reasons. Pending mechanisms return for review in later weeks.
+The scripts accept older state files. Existing discarded themes need a new review before they become structured mechanisms.
+
 The reflector uses the current agent harness. Its helper scripts do not invoke Claude or Codex.
 No separate model CLI or paired evaluator is required.
 Local patch proposals contain the complete replacement skill and hashes of the source and replacement.
@@ -44,6 +60,10 @@ Use skill-reflect in dry-run mode with RUN_DIR /tmp/skill-reflect-dry and --days
 ```
 
 It writes `candidates.json`, `proposals.json`, `digest.md` and `digest-detail.md` to that directory and sends nothing. Read `digest.md`. Each proposal names its target skill, the rule, and how many sessions back it.
+
+Use `archive` mode to save reviewed mechanisms without posting a digest.
+Give it a new `RUN_DIR` and the normal state path.
+It retains weak lessons locally and keeps the weekly cursor unchanged.
 
 ## 4. Test digest
 

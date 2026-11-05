@@ -16,6 +16,7 @@ How to make it work:
      run directory. To run it by hand:
        uv run --script finalize.py --run-dir /tmp/sr --mode dry-run
   --record writes the state file and is meant for the skill's live mode only.
+  --mode archive saves mechanisms without a Slack post or a cursor change.
 """
 
 from __future__ import annotations
@@ -46,8 +47,14 @@ class Evidence:
     """What candidates.json can vouch for."""
 
     def __init__(self, candidates: dict):
-        self.threads = {c["thread_id"]: c for c in candidates.get("candidates", [])}
-        self.jobs = {f"job:{r['job']}" for r in candidates.get("cron_recoveries", [])}
+        sessions = candidates.get("archived_candidates", []) + candidates.get(
+            "candidates", []
+        )
+        jobs = candidates.get("archived_cron_recoveries", []) + candidates.get(
+            "cron_recoveries", []
+        )
+        self.threads = {session["thread_id"]: session for session in sessions}
+        self.jobs = {f"job:{record['job']}" for record in jobs}
         usage = candidates.get("skill_usage", {})
         self.inventory = usage.get("inventory", {})
         self.source_files = usage.get("source_files", {})
@@ -203,6 +210,113 @@ def validate(
     return kept, dropped, ev, candidates
 
 
+def mechanism_problem(entry: dict) -> str | None:
+    required = ("id", "task_class", "mechanism", "status", "reason", "evidence")
+    if any(not entry.get(field) for field in required):
+        return "mechanism needs id, task_class, mechanism, status, reason, and evidence"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,119}", entry["id"]):
+        return "mechanism id must be a short lowercase slug"
+    if entry["status"] not in {"pending", "discarded"}:
+        return "mechanism status must be pending or discarded"
+    if not isinstance(entry["evidence"], list) or not all(
+        isinstance(identifier, str) for identifier in entry["evidence"]
+    ):
+        return "mechanism evidence must be a list of IDs"
+    return None
+
+
+def review_mechanisms(
+    run_dir: Path, candidates: dict, ev: Evidence, kept: list[dict]
+) -> list[dict]:
+    proposals = load_json(run_dir / "proposals.json", {})
+    if "mechanism_archive" not in candidates and "mechanisms" not in proposals:
+        return []
+    previous = {entry["id"]: entry for entry in candidates.get("mechanism_archive", [])}
+    reviewed = {}
+    for entry in proposals.get("mechanisms", []):
+        if reason := mechanism_problem(entry):
+            raise SystemExit(f"error: {reason}")
+        identifier = entry["id"]
+        if identifier in reviewed:
+            raise SystemExit(f"error: duplicate mechanism id: {identifier}")
+        earlier = previous.get(identifier, {})
+        evidence = list(dict.fromkeys(earlier.get("evidence", []) + entry["evidence"]))
+        if unknown := ev.unknown(evidence):
+            raise SystemExit(
+                f"error: mechanism evidence not in candidates: {', '.join(unknown)}"
+            )
+        reviewed[identifier] = {**earlier, **entry, "evidence": evidence}
+    covered = {
+        identifier for entry in reviewed.values() for identifier in entry["evidence"]
+    }
+    missing = (set(ev.threads) | ev.jobs) - covered
+    if missing:
+        raise SystemExit(f"error: unreviewed evidence: {', '.join(sorted(missing))}")
+    for proposal in kept:
+        identifier = proposal.get("mechanism_id")
+        entry = reviewed.get(identifier)
+        if not entry or not set(proposal["evidence"]).issubset(entry["evidence"]):
+            raise SystemExit(
+                f"error: proposal needs its reviewed mechanism_id: {proposal['title']}"
+            )
+        entry["status"] = "proposed"
+        entry["reason"] = "Evidence meets the proposal threshold."
+    return list(reviewed.values())
+
+
+def record_mechanisms(
+    state: dict, final: dict, candidates: dict, run_dir: Path
+) -> None:
+    current = {entry["thread_id"] for entry in candidates.get("candidates", [])}
+    current.update(
+        f"job:{entry['job']}" for entry in candidates.get("cron_recoveries", [])
+    )
+    archive = state.setdefault("mechanisms", {})
+    for mechanism in final.get("mechanisms", []):
+        identifier = mechanism["id"]
+        previous = archive.get(identifier, {})
+        sources = {
+            **previous.get("evidence_runs", {}),
+            **mechanism.get("evidence_runs", {}),
+        }
+        sources.update(
+            {
+                evidence: str(run_dir.resolve())
+                for evidence in mechanism["evidence"]
+                if evidence in current
+            }
+        )
+        archive[identifier] = {
+            **mechanism,
+            "evidence_runs": sources,
+            "first_seen_at": previous.get(
+                "first_seen_at", candidates["window"]["until"]
+            ),
+            "last_reviewed_at": candidates["window"]["until"],
+        }
+
+
+def write_state(state_path: Path, state: dict) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = state_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=1))
+    temporary.replace(state_path)
+
+
+def archive_review(
+    run_dir: Path, state_path: Path, final: dict, candidates: dict
+) -> None:
+    state = load_json(state_path, {"proposals": {}})
+    mechanisms = [
+        {**entry, "status": "pending", "reason": "Proposal awaits a posted digest."}
+        if entry["status"] == "proposed"
+        else entry
+        for entry in final["mechanisms"]
+    ]
+    record_mechanisms(state, {"mechanisms": mechanisms}, candidates, run_dir)
+    write_state(state_path, state)
+
+
 def render_digest(
     kept: list[dict], dropped: list[dict], candidates: dict, mode: str, run_dir: Path
 ) -> str:
@@ -310,19 +424,25 @@ def record(run_dir: Path, state_path: Path, permalink: str) -> dict:
             "permalink": permalink,
             "sent_at": now,
         }
+        if prop.get("mechanism_id"):
+            entry["mechanism_id"] = prop["mechanism_id"]
         if versions := prop.get("versions"):
             entry["versions"] = versions
             entry["skill_version"] = versions["candidate_sha256"]
-        state["proposals"].setdefault(prop["key"], entry)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=1))
+        previous = state.setdefault("proposals", {}).get(prop["key"], {})
+        if previous.get("status") not in {"applied", "rejected"}:
+            state["proposals"][prop["key"]] = {**previous, **entry}
+    record_mechanisms(state, final, candidates, run_dir)
+    write_state(state_path, state)
     return state
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--mode", choices=("dry-run", "test", "live"), required=True)
+    parser.add_argument(
+        "--mode", choices=("dry-run", "archive", "test", "live"), required=True
+    )
     parser.add_argument("--state", type=Path)
     parser.add_argument(
         "--record",
@@ -334,6 +454,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.mode == "archive" and not args.state:
+        raise SystemExit("error: --mode archive needs --state")
     if args.record:
         if args.mode != "live" or not args.state:
             raise SystemExit("error: --record needs --mode live and --state")
@@ -341,9 +463,17 @@ def main(argv: list[str]) -> int:
         print(f"recorded state in {args.state}")
         return 0
     state = load_json(args.state, {}) if args.state else {}
-    kept, dropped, _ev, candidates = validate(args.run_dir, state)
+    if (args.run_dir / "posted.json").exists():
+        raise SystemExit("error: this run was posted; create a new run directory")
+    kept, dropped, evidence, candidates = validate(args.run_dir, state)
+    mechanisms = review_mechanisms(args.run_dir, candidates, evidence, kept)
+    final = {"kept": kept, "dropped": dropped, "mechanisms": mechanisms}
     (args.run_dir / "proposals.final.json").write_text(
-        json.dumps({"kept": kept, "dropped": dropped}, ensure_ascii=False, indent=1)
+        json.dumps(
+            final,
+            ensure_ascii=False,
+            indent=1,
+        )
     )
     (args.run_dir / "digest.md").write_text(
         render_digest(kept, dropped, candidates, args.mode, args.run_dir)
@@ -351,6 +481,8 @@ def main(argv: list[str]) -> int:
     (args.run_dir / "digest-detail.md").write_text(
         render_detail(kept, candidates, args.run_dir)
     )
+    if args.mode == "archive":
+        archive_review(args.run_dir, args.state, final, candidates)
     print(json.dumps({"kept": len(kept), "dropped": dropped}, ensure_ascii=False))
     return 0
 
