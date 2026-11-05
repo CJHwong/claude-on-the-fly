@@ -249,9 +249,62 @@ class TestCheckCodexCli:
         with pytest.raises(SystemExit, match="codex CLI not found"):
             check_codex_cli()
 
+    @pytest.mark.parametrize(
+        "version",
+        [
+            "codex-cli 0.163.0",
+            "codex-cli 0.166.0",
+            "codex-cli 0.167.0-alpha.1",
+            "codex-cli 0.167.0+build.1",
+            "codex-cli 0.167.0 (build 1)",
+        ],
+    )
+    @patch("claude_on_the_fly.preflight.subprocess.run")
     @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/codex")
-    def test_succeeds_when_present(self, _mock_which):
-        check_codex_cli()  # should not raise
+    def test_accepts_supported_versions(self, _mock_which, mock_run, version):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, version, "")
+        check_codex_cli()
+        mock_run.assert_called_once_with(
+            ["codex", "--version"], capture_output=True, text=True, timeout=10
+        )
+
+    @pytest.mark.parametrize(
+        "version",
+        ["codex-cli 0.162.0", "codex-cli 0.163.0-alpha.1"],
+    )
+    @patch("claude_on_the_fly.preflight.subprocess.run")
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/codex")
+    def test_rejects_old_versions(self, _mock_which, mock_run, version):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, version, "")
+        with pytest.raises(SystemExit, match=r"requires Codex CLI 0\.163\.0 or later"):
+            check_codex_cli()
+
+    @pytest.mark.parametrize("version", ["unknown", "codex-cli 0.166.0garbage", ""])
+    @patch("claude_on_the_fly.preflight.subprocess.run")
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/codex")
+    def test_rejects_unknown_versions(self, _mock_which, mock_run, version):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, version, "")
+        with pytest.raises(SystemExit, match="Cannot determine Codex CLI version"):
+            check_codex_cli()
+
+    @patch("claude_on_the_fly.preflight.subprocess.run")
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/codex")
+    def test_rejects_failed_version_probe(self, _mock_which, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(
+            [], 1, "codex-cli 0.166.0", "failed"
+        )
+        with pytest.raises(SystemExit, match="Cannot determine Codex CLI version"):
+            check_codex_cli()
+
+    @pytest.mark.parametrize(
+        "failure", [OSError("cannot execute"), subprocess.TimeoutExpired("codex", 10)]
+    )
+    @patch("claude_on_the_fly.preflight.subprocess.run")
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/codex")
+    def test_reports_version_probe_errors(self, _mock_which, mock_run, failure):
+        mock_run.side_effect = failure
+        with pytest.raises(SystemExit, match="Cannot determine Codex CLI version"):
+            check_codex_cli()
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +313,27 @@ class TestCheckCodexCli:
 
 
 class TestCheckOllamaMode:
+    @pytest.mark.parametrize("version", ["0.162.0", "0.166.0"])
+    @patch("claude_on_the_fly.preflight.subprocess.run")
+    @patch("claude_on_the_fly.preflight.shutil.which", return_value="/usr/bin/cli")
+    def test_codex_ollama_checks_hook_trust_support(
+        self, _mock_which, mock_run, version, clear_backend_env, monkeypatch
+    ):
+        monkeypatch.setenv("OLLAMA_MODEL", "fixture:cloud")
+
+        def respond(command, **kwargs):
+            output = f"codex-cli {version}" if command[0] == "codex" else "NAME\n"
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+        mock_run.side_effect = respond
+        if version == "0.162.0":
+            with pytest.raises(
+                SystemExit, match=r"requires Codex CLI 0\.163\.0 or later"
+            ):
+                check_ollama_mode("codex")
+        else:
+            check_ollama_mode("codex")
+
     @patch(
         "claude_on_the_fly.preflight.shutil.which",
         side_effect=lambda name: None if name == "claude" else "/usr/bin/" + name,

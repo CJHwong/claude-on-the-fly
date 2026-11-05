@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 
@@ -83,6 +84,7 @@ _AGENT_INSTALL_HINTS = {
     "claude": "https://docs.anthropic.com/en/docs/claude-code",
     "codex": "https://github.com/openai/codex",
 }
+_CODEX_MIN_VERSION = (0, 163, 0)
 
 
 def check_backend() -> None:
@@ -158,10 +160,35 @@ def _check_agent_cli(profile: agent.AgentProfile) -> None:
 
 
 def check_codex_cli() -> None:
-    """Verify codex CLI is installed. Auth is checked at first use."""
+    """Check Codex installation and hook trust support. Auth waits until use."""
     if not shutil.which("codex"):
         raise _exit(f"codex CLI not found. Install it: {_AGENT_INSTALL_HINTS['codex']}")
+    _check_codex_version()
     logger.info("codex CLI: ok")
+
+
+def _check_codex_version() -> None:
+    """Reject CLIs that cannot bypass hook trust on unattended turns."""
+    try:
+        probe = subprocess.run(
+            ["codex", "--version"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _exit(f"Cannot determine Codex CLI version: {exc}") from exc
+    version = probe.stdout.strip()
+    match = re.match(r"codex-cli (\d+)\.(\d+)\.(\d+)(?=$|[-+\s])", version)
+    if probe.returncode != 0 or match is None:
+        raise _exit(
+            "Cannot determine Codex CLI version. Install Codex CLI 0.163.0 or later."
+        )
+    numeric_version = tuple(map(int, match.groups()))
+    suffix = version[match.end() :]
+    if numeric_version < _CODEX_MIN_VERSION or (
+        numeric_version == _CODEX_MIN_VERSION and suffix.startswith("-")
+    ):
+        raise _exit(
+            f"Hook trust bypass requires Codex CLI 0.163.0 or later; found {version}."
+        )
 
 
 def check_ollama_mode(agent_name: str = "claude") -> None:
@@ -203,6 +230,8 @@ def check_ollama_mode(agent_name: str = "claude") -> None:
                 f"OLLAMA_MODEL={model!r} not found in `ollama list`. "
                 f"Pull it first: ollama pull {model}"
             )
+    if agent_name == "codex":
+        _check_codex_version()
     logger.info("ollama launch mode: ok (agent=%s model=%s)", agent_name, model)
 
 

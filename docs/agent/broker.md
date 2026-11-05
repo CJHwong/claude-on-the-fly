@@ -171,6 +171,7 @@ than assumed, widen-scope choices are never selected, and an unreadable dialog i
 cancelled or left unanswered rather than guessed.
 
 Codex requires the hook trust bypass because inline hooks have no persisted trust entry.
+Every Codex launch carries that flag, including when tool approvals are off.
 Seatbelt therefore denies writes to Codex execution-control paths and re-grants only the
 runtime paths measured as necessary.
 

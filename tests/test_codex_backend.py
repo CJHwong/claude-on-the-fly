@@ -3504,6 +3504,30 @@ class TestEffortReachesTheInteractiveArgv:
         assert flag in exec_argv and flag in hosted_argv
 
 
+@pytest.mark.parametrize("approval_mode", ["off", "ask"])
+@pytest.mark.parametrize("ollama", [False, True])
+def test_every_codex_launch_bypasses_hook_trust(
+    tmp_path, monkeypatch, approval_mode, ollama
+):
+    from claude_on_the_fly import permissions
+
+    monkeypatch.setattr(
+        permissions, "configured", lambda: permissions.Permissions(mode=approval_mode)
+    )
+    launcher = OllamaLauncher(model="fixture:cloud") if ollama else None
+    backend = CodexBackend(launcher=launcher)
+    commands = [
+        backend._base_argv(tmp_path),
+        backend._interactive_argv(tmp_path, None, "hello"),
+        backend._interactive_argv(tmp_path, "existing-thread", "continue"),
+    ]
+    for command in commands:
+        assert command.count("--dangerously-bypass-hook-trust") == 1
+        assert any(part.startswith("hooks.PreToolUse=") for part in command) == (
+            approval_mode == "ask"
+        )
+
+
 class TestOllamaWebSearch:
     """ollama's Responses endpoint answers any request carrying the hosted
     web_search tool with `the web_search tool is not supported`, and codex sends
