@@ -1,0 +1,58 @@
+{
+  "docs/explanation/security-model.md": {
+    "sha256": "9ed48a1f35a8f39905785e9a0aa7f85412119e4b716e6863ee8a705da27bfb0e",
+    "mtime_ns": 1790220016868552288
+  },
+  "docs/agent/broker.md": {
+    "sha256": "c6cb5d1b62989c012b9bb77e9710943141f0e2fcc0b1df2018221a383b116dbf",
+    "mtime_ns": 1792685595777285313
+  },
+  "docs/agent/security-findings.md": {
+    "sha256": "0d585de4995248e0b8ee20fe0ead9bfb1029a7886421bd6dd76e534f94f14047",
+    "mtime_ns": 1790275132246084825
+  },
+  "src/claude_on_the_fly/broker.py": {
+    "sha256": "324bf77f8e2a859d9e320806b6165e326a6aac91555a1fc838bbe9af76b27508",
+    "mtime_ns": 1792685422379052291
+  },
+  "src/claude_on_the_fly/commands.py": {
+    "sha256": "ffd306fc4791b424a6404efb7c123667a9c227837d0700822db6bcfb68ddf880",
+    "mtime_ns": 1790222482688286388
+  },
+  "src/claude_on_the_fly/egress.py": {
+    "sha256": "abb23a751af8b2a9e75e964bc05d975859c120e59cbc82fa9a1969ca06e93f83",
+    "mtime_ns": 1790178803505925443
+  },
+  "src/claude_on_the_fly/permissions.py": {
+    "sha256": "b9bc6abe9b2b8bfc03333bf582ebaa35706ae40ffc1ae94ae375c8db8bac07f9",
+    "mtime_ns": 1789725237002237174
+  },
+  "src/claude_on_the_fly/approvals.py": {
+    "sha256": "340aeb625eb833a27f3fe513aefc8686b73f6dec2dde891f68a7bbcfdc94d673",
+    "mtime_ns": 1785771811644112632
+  },
+  "src/claude_on_the_fly/sandbox.py": {
+    "sha256": "064ce1138497ed1b2a4f1b589611e1228d51932031eeaa91b69aef778e06ae43",
+    "mtime_ns": 1792687066866733812
+  },
+  "src/claude_on_the_fly/sandbox_macos.py": {
+    "sha256": "01357e4646eea5f1a71a373a233da339dbf7b8cfaad0b9b36bf64a067686b1ca",
+    "mtime_ns": 1790220016873225891
+  },
+  "src/claude_on_the_fly/sandbox_linux.py": {
+    "sha256": "9a43c91c97fb4a4a6593a01ca5e326aab8f50ea8976f10763191afa8729d5d7a",
+    "mtime_ns": 1790152585552948169
+  },
+  "src/claude_on_the_fly/seatbelt/jail.sb": {
+    "sha256": "c933bac24ce394ef0e036dbcabbb01079ca8fb0eadfde55f0a0c3cac2769b7bf",
+    "mtime_ns": 1790220016874576551
+  },
+  "src/claude_on_the_fly/seatbelt/fs-allow-reads.sb": {
+    "sha256": "2a03f92447064e2aa9fe3564ac76d82222fda04870b14dd0ede18aba94383b26",
+    "mtime_ns": 1790220016873753638
+  },
+  "src/claude_on_the_fly/seatbelt/fs-deny-most.sb": {
+    "sha256": "3a7d32dc88d98f7ed36c1ed18ad87d62b570094cfcfd5a7150a2631985d8da7b",
+    "mtime_ns": 1790220016874237052
+  }
+}

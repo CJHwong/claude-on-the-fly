@@ -1,0 +1,15 @@
+{
+  "started_at": "2026-10-22T17:41:03+00:00",
+  "completed_at": "2026-10-22T18:41:43.541867+00:00",
+  "completed_at_taipei": "2026-10-23T02:41:43.541867+08:00",
+  "review_window_seconds": 3640.542,
+  "minimum_review_window_met": true,
+  "source_files_checked": 26,
+  "source_changes": [],
+  "all_assigned_expert_reports_delivered": true,
+  "production_code_changes": false,
+  "blocked_boundary_probes_retried": false,
+  "original_report_sha256": "72e44a4814e1407d994dd399c0fdf48cd3f273a69dc04a6a1e547626acfb6fce",
+  "packaged_report_sha256": "f2fd69acef190b13df42da1a9cf0f101a201803e13d03addbf7f29cf7b7d1f8b",
+  "note": "The packaged report uses portable links. Source fingerprints describe the completed study, not a later checkout."
+}
