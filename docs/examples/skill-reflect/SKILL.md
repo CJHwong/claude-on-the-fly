@@ -14,6 +14,7 @@ This skill writes procedures: how to do a class of task. A lesson about how the 
 | Mode | What it does | Who triggers it |
 | --- | --- | --- |
 | `dry-run` | Steps 1 to 5. Writes files only. Sends nothing. | A person testing the skill |
+| `archive` | Steps 1 to 5. Saves reviewed mechanisms locally. Sends nothing. Keeps the weekly cursor. | A person checking the archive |
 | `test` | Steps 1 to 6. Posts the digest to `<digest_to>`, marked as a test. Does not record state. | A person testing the skill |
 | `live` | Steps 1 to 7. | The weekly schedule |
 | `apply` | Reads an approval reply in a digest thread and runs `references/apply.md`. | The approver's reply |
@@ -41,8 +42,30 @@ Below, `<name>` means that key's value.
 ## Paths
 
 - `SKILL_DIR`: the directory of this file.
-- `RUN_DIR`: `~/.claude-on-the-fly/state/skill-reflect/runs/<YYYY-MM-DD>/` in `live` mode. The caller names it in `dry-run` and `test` modes. Keep it outside `<soul_root>`: `candidates.json` holds DM excerpts, and a soul repo is often committed and pushed on a schedule.
-- `STATE`: `~/.claude-on-the-fly/state/skill-reflect/state.json`. Only `live` and `apply` modes write it.
+- `RUN_DIR`: a new directory under `~/.claude-on-the-fly/state/skill-reflect/runs/` for each live run. The caller names it in other modes. Keep it outside `<soul_root>` because `candidates.json` holds conversation excerpts.
+- `STATE`: `~/.claude-on-the-fly/state/skill-reflect/state.json`. Only `archive`, `live`, and `apply` modes write it.
+
+Create a unique directory for each live run:
+
+```bash
+RUNS_DIR="$HOME/.claude-on-the-fly/state/skill-reflect/runs"
+mkdir -p "$RUNS_DIR"
+RUN_DIR="$(mktemp -d "$RUNS_DIR/$(date -u +%Y-%m-%dT%H-%M-%SZ)-XXXXXX")"
+```
+
+Never reuse a run directory. The selector refuses to overwrite `candidates.json`.
+After a digest is posted, the finalizer refuses to replace its files.
+
+### Archive reviewed mechanisms
+
+`STATE.mechanisms` retains every reviewed mechanism, including weak lessons and discarded noise.
+Each entry records its task class, mechanism, status, reason, evidence IDs, and source run paths.
+Keep excerpts in run files. Do not put excerpts, secrets, or personal details in a mechanism.
+Keep these run files because pending mechanisms use them as evidence.
+
+The next selection reloads pending mechanisms and their evidence, even before `last_run_at`.
+It writes them into `mechanism_archive`, `archived_candidates`, and `archived_cron_recoveries` in `candidates.json`.
+If archived evidence is missing, stop and restore its source run. Do not silently drop it.
 
 ### Review applied changes
 
@@ -65,11 +88,16 @@ The script reads the Codex thread index and rollouts, the Claude Code transcript
 
 ### 2. Cluster
 
-Read every candidate's excerpts and the `cron_recoveries` list. Group the evidence by **task class**, for example "creating a ticket from a Slack request" or "posting the daily standup". Do not group by person or by session.
+Read current candidates, archived candidates, and both recovery lists. Read every pending mechanism in `mechanism_archive`.
+Group evidence by task class and the mechanism that caused the result.
+Do not group by person or by session.
+If new evidence matches a pending mechanism, reuse its `id` and combine the evidence IDs.
+Keep a weak mechanism as `pending` when the evidence does not meet the threshold.
+Keep it pending when this week has no new evidence. Do not treat silence as proof.
 
 For each cluster, find the skill that was in use: look at `skills_read` and `skills_edited`. Then read that skill's current `SKILL.md` before you judge it. A lesson that the skill already states is not a lesson.
 
-Discard a cluster when any of these is true:
+Mark a mechanism `discarded`, with its reason and evidence IDs, when any condition below applies:
 
 - The signal is noise. The "correction" was a new request, or the "recovered error" was a normal retry with no lesson.
 - The fix is environment state: a missing binary, an expired token, an outage. The person can fix that once, so it is not a rule.
@@ -85,7 +113,8 @@ Keep a cluster only if one of these is true:
 - It has evidence from **2 or more distinct sessions**.
 - A person explicitly asked to remember it or to update the skill (an `explicit_ask` signal in its evidence).
 
-`finalize.py` checks this again in step 5. A cluster that fails there is dropped.
+`finalize.py` checks this again in step 5. A failed proposal leaves its mechanism pending.
+The threshold controls proposals. It does not control archive retention.
 
 ### 4. Write proposals
 
@@ -104,11 +133,22 @@ Follow `references/proposal-rules.md` for the content of every proposal. Write t
       "rule": "The rule as it will read in the skill. Imperative.",
       "why": "One clause: the mechanism that makes the rule matter.",
       "evidence": ["<thread_id>", "job:<cron job name>"],
+      "mechanism_id": "short-stable-slug",
       "explicit_ask": false,
       "patch_file": "patches/01-short-slug.md"
     }
   ],
-  "discarded": [{"theme": "short label", "reason": "which discard rule"}]
+  "discarded": [{"theme": "short label", "reason": "which discard rule"}],
+  "mechanisms": [
+    {
+      "id": "short-stable-slug",
+      "task_class": "The class of task",
+      "mechanism": "The reusable cause and procedure, without incident details.",
+      "status": "pending",
+      "reason": "One session supports the lesson. Keep it for later evidence.",
+      "evidence": ["<thread_id>", "job:<cron job name>"]
+    }
+  ]
 }
 ```
 
@@ -119,6 +159,11 @@ Follow `references/proposal-rules.md` for the content of every proposal. Write t
   - `note`: the skill belongs to a third party. Describe the issue only.
   - `profile-note`: one person's preference.
 - `evidence`: thread ids from `candidates.json`, or `job:<name>` from `cron_recoveries`. Never quote the excerpt.
+- `mechanism_id`: the `id` of the reviewed mechanism that supports the proposal.
+- `mechanisms`: record an outcome for every current and archived evidence ID, even when no proposal qualifies.
+- A mechanism's `id` uses lowercase letters, digits, and hyphens. Reuse an existing ID when the mechanism matches.
+- A mechanism's status is `pending` or `discarded`. The finalizer marks accepted mechanisms `proposed`.
+- Keep a useful single-session lesson pending. Keep noise discarded with its reason.
 - For a local `patch`, `patch_file` contains the complete proposed `SKILL.md`.
   Preserve all instructions outside the proposed change. The approver reviews the exact proposed text.
 
@@ -129,14 +174,20 @@ Do not claim that a review or a draft proves the procedure works.
 ### 5. Validate and render (script)
 
 ```bash
-uv run "$SKILL_DIR/scripts/finalize.py" --run-dir "$RUN_DIR" --mode <dry-run|test|live> [--state "$STATE"]
+uv run "$SKILL_DIR/scripts/finalize.py" --run-dir "$RUN_DIR" --mode <dry-run|archive|test|live> [--state "$STATE"]
 ```
 
 The script checks evidence IDs, the evidence threshold, ownership, and earlier rejections.
+It checks that every reviewed evidence ID has a mechanism outcome.
 For local patches, it records hashes of the installed source and the proposed replacement.
 It drops failures and records their reasons. The detail includes both hashes.
 Then it writes `RUN_DIR/digest.md` and `RUN_DIR/digest-detail.md`.
 Do not edit those files by hand. If the script drops a proposal, do not re-add it.
+
+In `archive` mode, pass `--state "$STATE"`.
+The script saves reviewed mechanisms without advancing `last_run_at` or recording sent proposals.
+Mechanisms with eligible drafts stay pending until a later live run posts their proposals.
+Stop after step 5 in this mode.
 
 ### 6. Post the digest (`test` and `live` only)
 
@@ -154,7 +205,8 @@ Read the returned XML for the message permalink. Attach `digest-detail.md` as a 
 uv run "$SKILL_DIR/scripts/finalize.py" --run-dir "$RUN_DIR" --mode live --state "$STATE" --record "<permalink>"
 ```
 
-This sets `last_run_at` and stores each proposal id with status `sent`.
+This sets `last_run_at`, stores sent proposals, and merges the reviewed mechanisms into the local archive.
+Record the run even when no proposal qualifies. Its weak mechanisms must survive the next weekly review.
 
 ## Apply mode
 
