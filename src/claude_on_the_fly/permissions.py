@@ -50,7 +50,7 @@ from claude_on_the_fly.approvals import ApprovalBroker, ApprovalRequest
 
 logger = logging.getLogger(__name__)
 
-# `off` gates nothing and is byte-identical to the pre-feature behaviour.
+# `off` does not request tool approvals.
 MODES = ("off", "ask")
 
 # --permission-mode values that are coherent with `ask`. `plan` is absent because
@@ -867,21 +867,18 @@ def claude_argv(resolved: Permissions | None = None, *, pty: bool = False) -> li
 
 
 def codex_argv(resolved: Permissions | None = None) -> list[str]:
-    """The codex flags that switch tool permissions on, or none when off.
+    """Always bypass hook trust; add the approval hook when permissions are on.
 
-    Two flags that have to travel together. The hook is injected via `-c` because
-    that merges with the operator's own ~/.codex/hooks.json rather than replacing
-    it, and the trust bypass is required because codex persists no trust entry for
-    an inline hook -- without it the hook is silently skipped and the command runs
-    anyway, which is the one failure this whole feature exists to prevent.
+    Unattended turns cannot answer a hook review dialog. The bypass also keeps
+    enabled hooks active under exec, which otherwise silently skips them.
+    The inline approval hook merges with the operator's hooks through `-c`.
 
-    The matching seatbelt denies on ~/.codex/{hooks.json,config.toml,rules} are
-    what make the bypass safe; without them an agent could write itself a hook that
-    codex would then run unreviewed.
+    The bypass applies to workspace hooks too. Sandbox rules protect host
+    execution-control files when the sandbox is enabled.
     """
     resolved = configured() if resolved is None else resolved
     if not resolved.enabled:
-        return []
+        return ["--dangerously-bypass-hook-trust"]
     hook = (
         'hooks.PreToolUse=[{hooks=[{type="command",'
         f'command="{shim_path()} hook",'

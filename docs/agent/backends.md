@@ -41,6 +41,15 @@ Cache rates fall back to the *prompt* rate when a model publishes none (184 of 3
   system prompt and the handoff, because `resume` on a missing rollout fails the turn
   outright (`thread/resume failed: no rollout found for thread id`).
 
+### Codex hook trust
+
+Codex CLI 0.163.0 or later is required in native, pty, and Ollama modes.
+Every launch passes `--dangerously-bypass-hook-trust`, including resume and compaction.
+This keeps enabled hooks active without a review dialog, even when `permissions.mode` is `off`.
+With approvals enabled, the same launch also carries the inline approval hook.
+The bypass runs enabled workspace hooks as well as host hooks.
+Protect hook configuration in persistent workspaces before you enable it.
+
 ### Account profiles
 
 `accounts` names authentication profiles; `routing` selects an alias for the active backend.

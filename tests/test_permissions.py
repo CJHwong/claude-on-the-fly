@@ -667,8 +667,10 @@ def test_claude_argv_is_the_old_pair_when_off(monkeypatch):
     ]
 
 
-def test_codex_argv_is_empty_when_off():
-    assert permissions.codex_argv(permissions.Permissions()) == []
+def test_codex_argv_bypasses_hook_trust_when_approvals_are_off():
+    assert permissions.codex_argv(permissions.Permissions()) == [
+        "--dangerously-bypass-hook-trust"
+    ]
 
 
 def test_claude_argv_sets_the_mode_and_the_prompt_tool_together():
