@@ -73,6 +73,10 @@ COMPACT_POLL_S = 0.1
 # the caller deliver the reply already in hand.
 POST_TURN_EXIT_GRACE = 30.0
 
+# has-session also returns false when its control call times out. Give a
+# finishing turn a bounded chance to persist its completion before failing it.
+PANE_MISSING_GRACE_S = 5.0
+
 CAPACITY_RETRY_DELAYS = (10, 30, 60)
 CAPACITY_RESUME_PROMPT = (
     "Continue the interrupted request from the recorded tool results. "
@@ -1073,6 +1077,7 @@ async def _run_codex_in_pane(
         await release.wait()
 
         deadline = None if timeout is None else time.monotonic() + timeout
+        missing_since: float | None = None
         while True:
             if follower.turn_completed.is_set():
                 # End the session here, not at the end of the run. The TUI does
@@ -1083,9 +1088,19 @@ async def _run_codex_in_pane(
                 tmux.kill(pane)
                 return 0, ""
             if not await asyncio.to_thread(tmux.alive, pane):
-                # The TUI went away without finishing. Whatever it printed on the
-                # way out is the only account of why.
-                return -1, _pane_output_tail(output_path)
+                # A failed probe can be a control timeout, and the rollout may
+                # still be flushing its final records. Do not discard completed
+                # work or replay it through the unhosted fallback.
+                follower._drain()
+                if follower.turn_completed.is_set():
+                    continue
+                now = time.monotonic()
+                if missing_since is None:
+                    missing_since = now
+                if now - missing_since >= PANE_MISSING_GRACE_S:
+                    return -1, _pane_output_tail(output_path)
+            else:
+                missing_since = None
             if deadline is not None and time.monotonic() > deadline:
                 logger.warning("codex exec: timed out after %ss", timeout)
                 raise RuntimeError(f"Codex CLI timed out after {timeout}s")

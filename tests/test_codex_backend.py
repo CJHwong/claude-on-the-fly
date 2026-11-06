@@ -2715,6 +2715,55 @@ class TestCodexInAPane:
         assert returncode == -1
         assert "boom-detail" in detail
 
+    @pytest.mark.parametrize("recover_probe", [False, True])
+    async def test_a_missed_pane_probe_does_not_discard_a_finishing_turn(
+        self, tmp_path: Path, monkeypatch, recover_probe: bool
+    ):
+        """A failed has-session can precede the durable completion record."""
+        from claude_on_the_fly import tmux as tmux_mod
+
+        pane = self._pane(tmp_path)
+        follower = self._follower(tmp_path)
+        probes = 0
+        drains = 0
+        killed = []
+
+        def alive(_pane):
+            nonlocal probes
+            probes += 1
+            # Landing succeeds, then one liveness probe fails. Some failures
+            # recover; others race the rollout writer after the pane exits.
+            return probes == 1 or (recover_probe and probes > 2)
+
+        def drain():
+            nonlocal drains
+            drains += 1
+            if drains >= 3:
+                follower.records.append(_task_complete("finished once"))
+                follower.turn_completed.set()
+
+        async def tick(_delay):
+            # The real follower keeps reading while the pane probe retries.
+            drain()
+
+        ok = MagicMock()
+        ok.returncode = 0
+        ok.communicate = AsyncMock(return_value=(b"", b""))
+        ok.wait = AsyncMock(return_value=0)
+        monkeypatch.setattr(tmux_mod, "alive", alive)
+        monkeypatch.setattr(tmux_mod, "kill", lambda p: killed.append(p.session))
+        monkeypatch.setattr(follower, "_drain", drain)
+        monkeypatch.setattr(codex_mod.asyncio, "sleep", tick)
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=ok)):
+            returncode, detail = await codex_mod._run_codex_in_pane(
+                pane, ["codex", "p"], tmp_path, {}, follower, timeout=30
+            )
+
+        assert returncode == 0
+        assert detail == ""
+        assert parse_codex_rollout(follower.records)["body"] == "finished once"
+        assert killed == [pane.session]
+
     async def test_tmux_refusing_to_host_runs_the_turn_unhosted(
         self, tmp_path: Path, caplog
     ):

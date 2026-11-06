@@ -161,6 +161,11 @@ session landing on another server, a script that cannot be staged — takes that
 fallback rather than the turn. A pane is a mirror, and losing the mirror must not cost
 the reply.
 
+A failed liveness probe can also mean the control command timed out. The Codex
+backend continues reading the rollout and rechecks the pane for up to five seconds,
+within the existing turn timeout. A durable completion still delivers the result;
+this grace period never starts another agent or repeats tool work.
+
 If a pane disappears before the turn completes, its tap is only a diagnostic. The
 reader takes at most the final 8 KiB, normalizes carriage returns, strips terminal
 controls, and retains at most 2,000 printable characters. The orchestrator sends
