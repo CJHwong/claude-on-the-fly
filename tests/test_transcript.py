@@ -6,6 +6,8 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from claude_on_the_fly import transcript
 from claude_on_the_fly.transcript import (
     Turn,
@@ -616,6 +618,89 @@ class TestFindLatestPriorTranscript:
             os.utime(rollout, (mtime, mtime))
         return rollout
 
+    def test_single_session_handoff_does_not_enumerate_siblings(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir, ndjson, monkeypatch
+    ):
+        workspace = tmp_path / "ws"
+        self._codex_session(
+            codex_sessions_dir, workspace, "mine", "thread-mine", ndjson
+        )
+        for index in range(10):
+            _write_mapping(workspace, f"sibling-{index}", f"thread-{index}")
+
+        def no_workspace_scan(_workspace):
+            pytest.fail("single-session handoff must not enumerate workspace mappings")
+
+        monkeypatch.setattr(
+            transcript.codex_state, "mappings_for_workspace", no_workspace_scan
+        )
+        original = transcript._find_codex_rollout
+        looked_up = []
+
+        def lookup(thread_id):
+            looked_up.append(thread_id)
+            return original(thread_id)
+
+        monkeypatch.setattr(transcript, "_find_codex_rollout", lookup)
+        result = transcript.find_latest_prior_transcript(workspace, only_uuid="mine")
+        assert result == (
+            [Turn("user", "hi"), Turn("assistant", "from codex")],
+            "codex",
+        )
+        assert looked_up and set(looked_up) == {"thread-mine"}
+
+    def test_missing_single_session_does_not_search_sibling_rollouts(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir, monkeypatch
+    ):
+        _write_mapping(tmp_path, "sibling", "thread-sibling")
+
+        def no_rollout_scan(_thread_id):
+            pytest.fail("missing session must not search sibling rollouts")
+
+        monkeypatch.setattr(transcript, "_find_codex_rollout", no_rollout_scan)
+        assert (
+            transcript.find_latest_prior_transcript(tmp_path, only_uuid="missing")
+            is None
+        )
+
+    def test_excluded_session_is_skipped_before_rollout_lookup(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir, ndjson, monkeypatch
+    ):
+        self._codex_session(
+            codex_sessions_dir, tmp_path, "prior", "thread-prior", ndjson
+        )
+        _write_mapping(tmp_path, "current", "thread-current")
+        original = transcript._find_codex_rollout
+
+        def lookup(thread_id):
+            assert thread_id != "thread-current", "excluded session triggered a scan"
+            return original(thread_id)
+
+        monkeypatch.setattr(transcript, "_find_codex_rollout", lookup)
+        result = transcript.find_latest_prior_transcript(
+            tmp_path, exclude_uuid="current"
+        )
+        assert result == (
+            [Turn("user", "hi"), Turn("assistant", "from codex")],
+            "codex",
+        )
+
+    def test_excluded_single_session_never_reads_its_mapping(
+        self, tmp_path, claude_projects_dir, codex_sessions_dir, monkeypatch
+    ):
+        _write_mapping(tmp_path, "current", "thread-current")
+
+        def no_mapping_read(*_args):
+            pytest.fail("excluded single-session handoff must not read its mapping")
+
+        monkeypatch.setattr(transcript.codex_state, "read_thread_id", no_mapping_read)
+        assert (
+            transcript.find_latest_prior_transcript(
+                tmp_path, only_uuid="current", exclude_uuid="current"
+            )
+            is None
+        )
+
     def test_returns_none_when_no_prior_sessions(
         self, tmp_path: Path, claude_projects_dir, codex_sessions_dir
     ):
@@ -1177,8 +1262,9 @@ class TestListCodexSessionFiles:
         monkeypatch.setattr(transcript.codex_state.os, "open", open_fails)
         assert transcript._list_codex_session_files(workspace) == []
 
+    @pytest.mark.parametrize("only_uuid", [None, "u1"])
     def test_a_mapping_symlink_is_skipped(
-        self, tmp_path: Path, codex_sessions_dir, monkeypatch
+        self, tmp_path: Path, codex_sessions_dir, monkeypatch, only_uuid
     ):
         mapping_root = tmp_path / "codex-mappings"
         monkeypatch.setattr(transcript.codex_state, "MAPPINGS_DIR", mapping_root)
@@ -1190,7 +1276,9 @@ class TestListCodexSessionFiles:
         mapping.unlink()
         mapping.symlink_to(target)
 
-        assert transcript._list_codex_session_files(workspace) == []
+        assert (
+            transcript._list_codex_session_files(workspace, only_uuid=only_uuid) == []
+        )
 
     def test_a_mapping_whose_rollout_is_gone_is_skipped(
         self, tmp_path: Path, codex_sessions_dir
@@ -1263,7 +1351,7 @@ class TestFindLatestPriorExcludesTheCurrentSession:
         monkeypatch.setattr(
             transcript,
             "_list_codex_session_files",
-            lambda _ws: [(Path("/y"), "current", 200.0)],
+            lambda _ws, **_scope: [(Path("/y"), "current", 200.0)],
         )
         assert (
             transcript.find_latest_prior_transcript(workspace, exclude_uuid="current")
@@ -1340,7 +1428,9 @@ class TestOneBadExtractorDoesNotStopTheSearch:
             "_list_claude_session_files",
             lambda _ws: [(Path("/x"), "newest", 200.0), (Path("/y"), "older", 100.0)],
         )
-        monkeypatch.setattr(transcript, "_list_codex_session_files", lambda _ws: [])
+        monkeypatch.setattr(
+            transcript, "_list_codex_session_files", lambda _ws, **_scope: []
+        )
 
         def extract(_workspace, uuid):
             if uuid == "newest":
@@ -1364,7 +1454,9 @@ class TestOneBadExtractorDoesNotStopTheSearch:
             "_list_claude_session_files",
             lambda _ws: [(Path("/x"), "only", 200.0)],
         )
-        monkeypatch.setattr(transcript, "_list_codex_session_files", lambda _ws: [])
+        monkeypatch.setattr(
+            transcript, "_list_codex_session_files", lambda _ws, **_scope: []
+        )
         monkeypatch.setattr(
             transcript,
             "extract_claude",
@@ -1496,7 +1588,7 @@ class TestHandoffScope:
         monkeypatch.setattr(
             transcript,
             "_list_codex_session_files",
-            lambda _ws: [(Path("/y"), "mine", 100.0)],
+            lambda _ws, **_scope: [(Path("/y"), "mine", 100.0)],
         )
         monkeypatch.setattr(
             transcript, "extract_codex", lambda _ws, uuid: [Turn("user", uuid)]

@@ -572,15 +572,30 @@ def _list_claude_session_files(workspace: Path) -> list[tuple[Path, str, float]]
     return out
 
 
-def _list_codex_session_files(workspace: Path) -> list[tuple[Path, str, float]]:
-    """Return (rollout_path, our_uuid, rollout_mtime) for every codex mapping
-    in the daemon-owned store whose rollout still exists."""
+def _list_codex_session_files(
+    workspace: Path,
+    *,
+    exclude_uuid: str | None = None,
+    only_uuid: str | None = None,
+) -> list[tuple[Path, str, float]]:
+    """Return existing Codex rollouts in the requested session scope.
+
+    Filter before locating rollouts: each lookup walks the sessions trees. A
+    shared chat handoff needs one UUID, so read its authenticated mapping
+    directly instead of enumerating every sibling and searching for each file.
+    """
+    session_uuids = (
+        (only_uuid,)
+        if only_uuid is not None
+        else (
+            session_uuid
+            for _, session_uuid, _ in codex_state.mappings_for_workspace(workspace)
+        )
+    )
     out: list[tuple[Path, str, float]] = []
-    for (
-        _mapping_path,
-        session_uuid,
-        _mapping_mtime,
-    ) in codex_state.mappings_for_workspace(workspace):
+    for session_uuid in session_uuids:
+        if not _wanted(session_uuid, exclude_uuid, only_uuid):
+            continue
         thread_id = codex_state.read_thread_id(workspace, session_uuid)
         if thread_id is None:
             continue
@@ -622,7 +637,9 @@ def find_latest_prior_transcript(
     for _path, uuid, mtime in _list_claude_session_files(workspace):
         if _wanted(uuid, exclude_uuid, only_uuid):
             candidates.append((mtime, uuid, "claude", uuid))
-    for _path, uuid, mtime in _list_codex_session_files(workspace):
+    for _path, uuid, mtime in _list_codex_session_files(
+        workspace, exclude_uuid=exclude_uuid, only_uuid=only_uuid
+    ):
         if _wanted(uuid, exclude_uuid, only_uuid):
             candidates.append((mtime, uuid, "codex", uuid))
     if not candidates:
