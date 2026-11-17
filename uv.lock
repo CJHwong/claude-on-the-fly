@@ -189,7 +189,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "markdown-it-py", specifier = ">=3.0.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
-    { name = "python-liquid", specifier = ">=2.1.0" },
+    { name = "python-liquid", specifier = ">=2.1.0,<3" },
     { name = "python-telegram-bot", specifier = ">=22.7" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=15.0.0" },

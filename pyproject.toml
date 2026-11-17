@@ -11,7 +11,8 @@ dependencies = [
     "httpx>=0.28.1",
     "markdown-it-py>=3.0.0",
     "python-dotenv>=1.2.2",
-    "python-liquid>=2.1.0",
+    # v3 removes Environment.from_string and changes template rendering APIs.
+    "python-liquid>=2.1.0,<3",
     "python-telegram-bot>=22.7",
     "pyyaml>=6.0",
     "rich>=15.0.0",
