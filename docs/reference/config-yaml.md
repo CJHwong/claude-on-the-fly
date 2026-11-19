@@ -385,7 +385,7 @@ not an unbounded workspace history replay. None of these bounds is a setting.
 |---|---|---|---|
 | `allowed_senders` | list / token identity | Humans or explicitly listed bot IDs allowed to trigger | Immediate |
 | `blocked_senders` | list / empty | Deny list; wins over allowed | Immediate |
-| `silent_senders` | list / empty | Trigger without posting a reply | Immediate |
+| `silent_senders` | list / empty | Heard, never answered: plain messages run with no reply; commands and taps are dropped (see below) | Immediate |
 | `bot_policies` | mapping / empty | Per-allowed-bot pre-agent gate; see below | Immediate |
 | `stats` | string / `summary` | `off`, `summary`, `detailed`; invalid uses summary | Immediate |
 | `slash_command` | string / unset | Bot-token Slack command | Restart required |
@@ -437,8 +437,51 @@ It defaults on because this gate discards work before the agent sees it, and a
 pattern that does not match what its author expected should be a log line rather
 than silence. An invalid policy logs an error once per configuration and preserves
 the existing trusted-bot behavior instead of silently discarding work.
-`silent_senders` remains independent: it suppresses the reply only after an allowed
-event has run.
+`silent_senders` remains independent: it applies only to an allowed event.
+
+### Silent senders
+
+A sender in `silent_senders` is heard and never answered. It must also be allowed.
+
+- **A plain message** runs a turn as usual, and the turn's reply is not posted.
+- **A `$` command is dropped** before it posts or reaches the agent: `$stop`,
+  `$compact`, `$model`, `$continue` (with any text after it, which does not run),
+  and the `job_command` trigger, bare or with a task, while the job queue is on.
+  Nothing is aborted, compacted, pinned or queued, a dropped `$continue` leaves
+  the thread's gated backlog in place, and the message is marked processed. Text
+  that only looks like a command (`$stop now`, or the trigger with the queue off)
+  is a plain message.
+- **A slash command, message shortcut or skill-picker submit is dropped.** Slack
+  gets its acknowledgement and nothing else: no response, no anchor message, no
+  picker, no turn.
+- **A button tap is dropped**: a suggestion button, the Continue and replay
+  buttons on the gate and mention notices, and an approval card's buttons. A
+  dropped suggestion tap leaves the menu as it was. A silent person cannot answer
+  the approval card on their own turn: somebody else must, or the request is
+  denied when it times out.
+- **No notices.** An untagged channel message gets no mention notice. A message
+  over the reply soft-limit is gated (it takes the lock reaction and waits in the
+  thread's backlog) with no notice, and a notice already pending for somebody
+  else in the thread is left as it is. The silent sender cannot clear the gate.
+  Somebody else can: the Continue button on that person's own gate notice runs
+  the thread's backlog, the silent sender's messages included, and a typed
+  `$continue` from that person resumes the thread and discards the backlog.
+
+What still shows for a silent sender's plain message: the reactions on it, the
+assistant status line under a bot token, and an approval card if the turn needs
+a grant. Three paths can still post a silent sender's reply:
+
+- a turn journaled before a restart is resumed with no record that it was silent,
+  so its reply posts, and a turn too old to resume is offered back with a nudge
+  that posts in the thread;
+- automatic compaction (`agent.auto_compact_pct`) queues a compaction turn that
+  takes the triggering message's reply entry, so the turns behind it in that
+  thread take the entry of the turn after them, and the last one posts. The same
+  shift can drop a reply owed to a sender who is not silent;
+- a skill-picker run that a non-silent person starts from the message shortcut
+  shifts the entries the same way when a silent sender's message queues behind
+  it in that thread: the silent sender's reply posts and the run's reply is
+  dropped.
 
 ## `telegram`
 
