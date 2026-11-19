@@ -469,7 +469,7 @@ A sender in `silent_senders` is heard and never answered. It must also be allowe
 
 What still shows for a silent sender's plain message: the reactions on it, the
 assistant status line under a bot token, and an approval card if the turn needs
-a grant. Two paths can still post a silent sender's reply:
+a grant. Three paths can still post a silent sender's reply:
 
 - a turn journaled before a restart is resumed with no record that it was silent,
   so its reply posts, and a turn too old to resume is offered back with a nudge
@@ -477,11 +477,11 @@ a grant. Two paths can still post a silent sender's reply:
 - automatic compaction (`agent.auto_compact_pct`) queues a compaction turn that
   takes the triggering message's reply entry, so the turns behind it in that
   thread take the entry of the turn after them, and the last one posts. The same
-  shift can drop a reply owed to a sender who is not silent.
-
-A skill-picker run that a non-silent person starts from the message shortcut
-shifts the entries the same way when a silent sender's message queues behind it
-in that thread: the silent sender's reply posts and the run's reply is dropped.
+  shift can drop a reply owed to a sender who is not silent;
+- a skill-picker run that a non-silent person starts from the message shortcut
+  shifts the entries the same way when a silent sender's message queues behind
+  it in that thread: the silent sender's reply posts and the run's reply is
+  dropped.
 
 ## `telegram`
 

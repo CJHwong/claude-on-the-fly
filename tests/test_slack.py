@@ -8854,6 +8854,66 @@ class TestSilentSendersAreHeardNotAnswered:
         assert self._posts(fe) == 0
         assert "9.0" in fe._processed_ts
 
+    @pytest.mark.parametrize("channel,channel_type", [("C1", "channel"), ("D1", "im")])
+    @pytest.mark.parametrize("text", ["<@U_SELF> $stop", "<@U_SELF> $model opus"])
+    async def test_a_policy_bots_tagged_command_is_dropped(
+        self, channel, channel_type, text
+    ):
+        """A bot policy strips the bot's tag in every channel type, DMs
+        included, so the branches would see the bare command. The drop must
+        judge the same stripped text."""
+        with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
+            mock_app = MagicMock()
+            mock_app.client = MagicMock()
+            for name in ("chat_postMessage", "chat_postEphemeral", "chat_update"):
+                setattr(
+                    mock_app.client,
+                    name,
+                    AsyncMock(return_value={"ok": True, "ts": "n.0"}),
+                )
+            mock_app_cls.return_value = mock_app
+            fe = SlackFrontend(
+                "xapp-tok",
+                "xoxp-tok",
+                "U_SELF",
+                allowed_user_ids={"U_ALLOWED"},
+                allowed_bot_ids={"B_BOT"},
+                bot_policies={"B_BOT": {"mode": "all"}},
+                silent_sender_ids={"B_BOT"},
+            )
+        fe._on_message = AsyncMock()
+        orch = self._orchestrator()
+        fe._orchestrator = orch
+        event = {
+            "subtype": "bot_message",
+            "bot_id": "B_BOT",
+            "ts": "100.0",
+            "text": text,
+            "channel": channel,
+            "channel_type": channel_type,
+        }
+
+        await fe._ingest_event(event)
+
+        orch.abort.assert_not_awaited()
+        orch.on_model.assert_not_called()
+        assert self._posts(fe) == 0
+        fe._on_message.assert_not_awaited()
+        assert "100.0" in fe._processed_ts
+
+    async def test_a_padded_command_is_dropped(self):
+        """The parser strips the text it is given, as the branches always did."""
+        fe = self._frontend({"U_ALLOWED"})
+        orch = self._orchestrator()
+        fe._orchestrator = orch
+
+        await fe._ingest_event(self._dm("9.0", "  $stop  "))
+
+        orch.abort.assert_not_awaited()
+        fe._on_message.assert_not_awaited()  # a command, not a plain message
+        assert self._posts(fe) == 0
+        assert "9.0" in fe._processed_ts
+
     async def test_a_command_re_read_by_catch_up_is_dropped(self):
         """Catch-up re-ingests with `replayed=True` and no original: it is the
         sender's own text, so it is judged like a live message."""
