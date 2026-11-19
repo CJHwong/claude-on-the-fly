@@ -8610,3 +8610,447 @@ class TestCatchupReviewFixes:
         await frontend.stop()
 
         assert frontend._hello_task.cancelled()
+
+
+# ---------------------------------------------------------------------------
+# silent_senders: heard, never answered
+# ---------------------------------------------------------------------------
+
+
+class TestSilentSendersAreHeardNotAnswered:
+    """A silent sender's plain message runs a turn whose reply is not posted.
+    Everything else they can send is dropped where it enters: no post, no
+    orchestrator call, no turn."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_sender_env(self, monkeypatch):
+        # The trigger and the sender lists resolve per instance from the
+        # environment, so a real value in the developer's shell would otherwise
+        # decide what this class tests.
+        monkeypatch.delenv("SLACK_JOB_COMMAND", raising=False)
+        monkeypatch.delenv("SLACK_SILENT_SENDER_IDS", raising=False)
+
+    @staticmethod
+    def _frontend(silent: set[str], queue=None):
+        with patch("claude_on_the_fly.slack.AsyncApp") as mock_app_cls:
+            mock_app = MagicMock()
+            mock_app.client = MagicMock()
+            for name in (
+                "chat_postMessage",
+                "chat_postEphemeral",
+                "chat_update",
+                "reactions_add",
+                "reactions_remove",
+                "views_open",
+                "conversations_replies",
+            ):
+                setattr(
+                    mock_app.client,
+                    name,
+                    AsyncMock(return_value={"ok": True, "ts": "n.0"}),
+                )
+            mock_app.client.users_info = AsyncMock(
+                return_value={"user": {"name": "testuser"}}
+            )
+            mock_app.client.conversations_info = AsyncMock(
+                return_value={
+                    "channel": {
+                        "name": "general",
+                        "is_mpim": False,
+                        "is_private": False,
+                    }
+                }
+            )
+            mock_app.client.conversations_members = AsyncMock()
+            mock_app.client.conversations_history = AsyncMock(
+                return_value={"messages": []}
+            )
+            mock_app_cls.return_value = mock_app
+            fe = SlackFrontend(
+                "xapp-tok",
+                "xoxp-tok",
+                "U_SELF",
+                allowed_user_ids={"U_ALLOWED", "U_LOUD"},
+                silent_sender_ids=silent,
+                job_command="$job",
+                job_queue=queue if queue is not None else _FakeJobQueue(),
+            )
+            fe._on_message = AsyncMock()
+            return fe
+
+    @staticmethod
+    def _orchestrator() -> MagicMock:
+        orch = MagicMock()
+        orch.abort = AsyncMock(return_value=True)
+        orch.on_compact = AsyncMock()
+        orch.on_model = MagicMock(return_value="pinned")
+        orch.note_handler_failure = AsyncMock()
+        return orch
+
+    @staticmethod
+    def _posts(fe) -> int:
+        client = fe._app.client
+        return (
+            client.chat_postMessage.await_count
+            + client.chat_postEphemeral.await_count
+            + client.chat_update.await_count
+        )
+
+    @staticmethod
+    def _dm(ts: str, text: str, user: str = "U_ALLOWED") -> dict:
+        return {
+            "ts": ts,
+            "text": text,
+            "channel": "D1",
+            "channel_type": "im",
+            "user": user,
+        }
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "$stop",
+            "$compact",
+            "$model",
+            "$model opus",
+            "$job",
+            "$job summarize the incident",
+            "$continue",
+            "$continue and then this",
+        ],
+    )
+    async def test_a_command_is_dropped_at_intake(self, text):
+        queue = _FakeJobQueue()
+        fe = self._frontend({"U_ALLOWED"}, queue)
+        orch = self._orchestrator()
+        fe._orchestrator = orch
+        session_id = _session_key("D1", "9.0")
+        fe._reply_counts[session_id] = 3
+
+        await fe._ingest_event(self._dm("9.0", text))
+
+        assert self._posts(fe) == 0
+        # Health bookkeeping after every handled event is not a command.
+        called = [c[0] for c in orch.mock_calls if c[0] != "note_handler_success"]
+        assert called == []
+        assert queue.jobs == []
+        fe._on_message.assert_not_awaited()
+        assert not fe._pending_msg
+        # `$continue <text>` goes whole: no reset, and the text does not run.
+        assert fe._reply_counts[session_id] == 3
+        assert "9.0" in fe._processed_ts
+
+    async def test_a_tagged_command_in_a_channel_is_dropped(self):
+        fe = self._frontend({"U_ALLOWED"})
+        orch = self._orchestrator()
+        fe._orchestrator = orch
+        event = {
+            "ts": "9.0",
+            "thread_ts": "t1",
+            "text": "<@U_SELF> $stop",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+        }
+
+        await fe._ingest_event(event)
+
+        orch.abort.assert_not_awaited()
+        assert self._posts(fe) == 0
+        assert "9.0" in fe._processed_ts
+
+    async def test_a_command_re_read_by_catch_up_is_dropped(self):
+        """Catch-up re-ingests with `replayed=True` and no original: it is the
+        sender's own text, so it is judged like a live message."""
+        fe = self._frontend({"U_ALLOWED"})
+        orch = self._orchestrator()
+        fe._orchestrator = orch
+
+        await fe._ingest_event(self._dm("9.0", "$stop"), replayed=True)
+
+        orch.abort.assert_not_awaited()
+        assert self._posts(fe) == 0
+
+    async def test_the_same_command_from_a_sender_not_silent_still_runs(self):
+        fe = self._frontend({"U_ALLOWED"})
+        orch = self._orchestrator()
+        fe._orchestrator = orch
+
+        await fe._ingest_event(self._dm("9.0", "$stop", user="U_LOUD"))
+
+        orch.abort.assert_awaited_once()
+        fe._app.client.chat_postMessage.assert_awaited_once()
+
+    async def test_a_plain_message_still_runs_with_its_reply_suppressed(self):
+        fe = self._frontend({"U_ALLOWED"})
+
+        await fe._ingest_event(self._dm("9.0", "disk is at 91%"))
+
+        fe._on_message.assert_awaited_once()
+        session_id = _session_key("D1", "9.0")
+        assert list(fe._pending_reply_suppressed[session_id]) == [True]
+        await fe.notify_start(session_id)
+        await fe.send(session_id, Response(body="noted", suggestions=[]))
+        fe._app.client.chat_postMessage.assert_not_awaited()
+
+    async def test_a_gated_message_replayed_by_continue_still_runs(self):
+        """`_replay_gated` puts `$continue` in front of every replay. That prefix
+        is the bridge's, not the sender's, so the silent sender's plain message
+        must still run when somebody else presses Continue."""
+        fe = self._frontend({"U_ALLOWED"})
+        gated = {
+            "ts": "90.0",
+            "thread_ts": "t1",
+            "text": "<@U_SELF> disk is at 91%",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+        }
+
+        await fe._replay_gated("C1", [gated])
+
+        fe._on_message.assert_awaited_once()
+        session_id = _session_key("C1", "t1")
+        assert list(fe._pending_reply_suppressed[session_id]) == [True]
+
+    async def test_an_untagged_message_gets_no_mention_hint(self, monkeypatch):
+        monkeypatch.setattr(slack_mod, "mention_notice_seconds", lambda: 3600)
+        fe = self._frontend({"U_ALLOWED"})
+        session_id = _session_key("C1", "t1")
+        fe._sessions[session_id] = ("C1", "t1")
+        fe._mention_taggers[session_id] = {"U_ALLOWED", "U_LOUD"}
+        event = {
+            "ts": "t2",
+            "thread_ts": "t1",
+            "text": "and one more thing",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": "U_ALLOWED",
+        }
+
+        await fe._ingest_event(event)
+
+        assert (session_id, "U_ALLOWED") not in fe._mention_notices
+        assert (session_id, "U_ALLOWED") not in fe._untagged_msgs
+        # The same slip from a sender not silent is still scheduled.
+        await fe._ingest_event({**event, "ts": "t3", "user": "U_LOUD"})
+        assert (session_id, "U_LOUD") in fe._mention_notices
+        fe._cancel_thread_mention_notices(session_id)
+
+    async def test_over_the_soft_limit_a_silent_sender_is_gated_with_no_notice(
+        self, no_notice_delay
+    ):
+        fe = self._frontend({"U_ALLOWED"})
+        session_id = _session_key("D1", "200.0")
+        fe._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        dm = {**self._dm("201.0", "another alert"), "thread_ts": "200.0"}
+
+        await fe._ingest_event(dm)
+
+        fe._on_message.assert_not_awaited()
+        assert [e["ts"] for e in fe._gated_msgs[session_id]] == ["201.0"]
+        assert session_id not in fe._gate_notices
+        assert self._posts(fe) == 0
+
+    async def test_a_pending_notice_for_someone_else_survives_a_silent_gate(
+        self, no_notice_delay
+    ):
+        fe = self._frontend({"U_ALLOWED"})
+        session_id = _session_key("C1", "t1")
+        fe._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+
+        def tagged(ts: str, user: str) -> dict:
+            return {
+                "ts": ts,
+                "thread_ts": "t1",
+                "text": "<@U_SELF> more",
+                "channel": "C1",
+                "channel_type": "channel",
+                "user": user,
+            }
+
+        await fe._ingest_event(tagged("t2", "U_LOUD"))
+        notice = fe._gate_notices[session_id]
+        await fe._ingest_event(tagged("t3", "U_ALLOWED"))
+
+        assert fe._gate_notices.get(session_id) is notice
+        await notice
+        sent = fe._app.client.chat_postEphemeral.await_args.kwargs
+        assert sent["user"] == "U_LOUD"
+        assert fe._app.client.chat_postEphemeral.await_count == 1
+
+    # -- button taps ---------------------------------------------------------
+
+    @staticmethod
+    def _suggestion_tap(user_id: str) -> dict:
+        return {
+            "user": {"id": user_id, "name": "hoss"},
+            "channel": {"id": "C1"},
+            "message": {
+                "ts": "99.1",
+                "thread_ts": "t1",
+                "text": "hello",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "hello"}},
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "more?"},
+                                "action_id": "cotf-sugg:0",
+                            }
+                        ],
+                    },
+                ],
+            },
+            "actions": [
+                {
+                    "action_id": "cotf-sugg:0",
+                    "text": {"type": "plain_text", "text": "more?"},
+                }
+            ],
+        }
+
+    async def test_a_suggestion_tap_is_dropped(self):
+        fe = self._frontend({"U_ALLOWED"})
+        session_id = _session_key("C1", "t1")
+        fe._sessions[session_id] = ("C1", "t1")
+
+        await fe._on_suggestion_action(self._suggestion_tap("U_ALLOWED"))
+
+        fe._on_message.assert_not_awaited()
+        assert self._posts(fe) == 0  # the menu is not retired either
+        assert not fe._pending_msg
+        assert fe._reply_counts.get(session_id, 0) == 0
+        # The menu is still live for somebody else's tap.
+        assert ("C1", "99.1") not in fe._spent_menus
+
+    async def test_a_suggestion_tap_from_a_sender_not_silent_gets_its_reply(self):
+        fe = self._frontend({"U_ALLOWED"})
+        session_id = _session_key("C1", "t1")
+        fe._sessions[session_id] = ("C1", "t1")
+        fe._workspace_names[session_id] = "channel/C1"
+
+        await fe._on_suggestion_action(self._suggestion_tap("U_LOUD"))
+
+        fe._on_message.assert_awaited_once()
+        fe._app.client.chat_postMessage.reset_mock()
+        await fe.notify_start(session_id)
+        await fe.send(session_id, Response(body="here", suggestions=[]))
+        fe._app.client.chat_postMessage.assert_awaited_once()
+
+    async def test_a_continue_tap_is_dropped(self):
+        fe = self._frontend({"U_ALLOWED"})
+        session_id = _session_key("C1", "t1")
+        fe._reply_counts[session_id] = DEFAULT_REPLY_SOFT_LIMIT
+        fe._gated_msgs[session_id] = [{"ts": "90.0", "channel": "C1"}]
+        fe._delete_ephemeral = AsyncMock()
+
+        await fe._on_continue_action(
+            {
+                "user": {"id": "U_ALLOWED"},
+                "channel": {"id": "C1"},
+                "response_url": "https://hooks.slack.test/actions/1",
+                "actions": [
+                    {"action_id": slack_mod.CONTINUE_ACTION_ID, "value": "C1|t1"}
+                ],
+            }
+        )
+
+        assert fe._reply_counts[session_id] == DEFAULT_REPLY_SOFT_LIMIT
+        assert session_id in fe._gated_msgs
+        fe._on_message.assert_not_awaited()
+        fe._delete_ephemeral.assert_not_awaited()
+
+    async def test_a_replay_tap_is_dropped(self):
+        fe = self._frontend({"U_ALLOWED"})
+        session_id = _session_key("C1", "t1")
+        held = [{"ts": "t2", "channel": "C1", "text": "x", "user": "U_ALLOWED"}]
+        fe._untagged_msgs[(session_id, "U_ALLOWED")] = held
+        fe._delete_ephemeral = AsyncMock()
+
+        await fe._on_replay_action(
+            {
+                "user": {"id": "U_ALLOWED"},
+                "channel": {"id": "C1"},
+                "response_url": "https://hooks.slack.test/actions/1",
+                "actions": [{"action_id": "x", "value": "C1|t1"}],
+            }
+        )
+
+        fe._on_message.assert_not_awaited()
+        assert fe._untagged_msgs[(session_id, "U_ALLOWED")] == held
+        fe._delete_ephemeral.assert_not_awaited()
+
+    async def test_an_approval_click_is_dropped(self):
+        fe = self._frontend({"U_ALLOWED"})
+        future = asyncio.get_running_loop().create_future()
+        fe._pending_approvals["abc"] = future
+
+        await fe._on_approval_action(
+            {
+                "user": {"id": "U_ALLOWED"},
+                "actions": [{"action_id": "cotf-grant", "value": "abc"}],
+            }
+        )
+
+        assert not future.done()
+
+    # -- slash command, shortcut, picker -------------------------------------
+
+    @pytest.mark.parametrize("text", ["simplify make it lean", ""])
+    async def test_a_slash_command_is_acknowledged_only(self, text):
+        fe = self._frontend({"U_ALLOWED"})
+        ack, respond = AsyncMock(), AsyncMock()
+
+        await fe._handle_slash_command(
+            ack,
+            {"text": text, "channel_id": "D1", "user_id": "U_ALLOWED"},
+            {"trigger_id": "trig"},
+            respond,
+        )
+
+        ack.assert_awaited_once()
+        respond.assert_not_awaited()
+        fe._app.client.views_open.assert_not_awaited()
+        assert self._posts(fe) == 0  # no anchor
+        fe._on_message.assert_not_awaited()
+
+    async def test_a_shortcut_is_acknowledged_only(self):
+        fe = self._frontend({"U_ALLOWED"})
+        ack = AsyncMock()
+
+        await fe._handle_run_skill_shortcut(
+            ack,
+            {
+                "trigger_id": "trig",
+                "channel": {"id": "D1"},
+                "user": {"id": "U_ALLOWED"},
+                "message": {"ts": "1.0", "thread_ts": "5.0"},
+            },
+        )
+
+        ack.assert_awaited_once()
+        fe._app.client.views_open.assert_not_awaited()
+        fe._on_message.assert_not_awaited()
+
+    @pytest.mark.parametrize("metadata", ["D1:U_ALLOWED", "D1:U_ALLOWED:5.0"])
+    async def test_a_picker_submit_is_acknowledged_only(self, metadata):
+        fe = self._frontend({"U_ALLOWED"})
+        ack = AsyncMock()
+        view = {
+            "private_metadata": metadata,
+            "state": {
+                "values": {
+                    "skill": {"cof_skill": {"selected_option": {"value": "simplify"}}},
+                    "args": {"cof_args": {"value": "trim it"}},
+                }
+            },
+        }
+
+        await fe._handle_picker_submit(ack, view)
+
+        ack.assert_awaited_once()
+        assert self._posts(fe) == 0  # no anchor
+        fe._on_message.assert_not_awaited()

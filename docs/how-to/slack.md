@@ -67,7 +67,8 @@ slack:
   allowed_senders: [U111, U222, B07JPABE2]
   # Denied senders, users or bots. Wins over the allowlist.
   blocked_senders: [U999]
-  # Senders that trigger Claude but get no reply posted back.
+  # Senders heard but never answered: no reply, and their $ commands, slash
+  # commands and button taps are dropped.
   silent_senders: [B07JPABE2]
   # Optional pre-agent gate for an allowed automation bot. The patterns are
   # yours: write the ones that describe your bot's messages.
@@ -113,7 +114,7 @@ next one without a restart.
 - With a **bot token**, the auto-allowed ID is the bot's, not yours — add your own `U…` id to `slack.allowed_senders` (or use `"*"`; the quotes are required by YAML) or your DMs will be dropped
 - In channels, only allowed senders (auto-allowed ID + `slack.allowed_senders`) can trigger Claude via @mention
 - Bot posts (HubSpot, Jira, etc.) are ignored unless their bot ID (`B…`) is in `slack.allowed_senders`; trusted bot posts trigger Claude without an @mention. Don't list this app's own bot ID (it would loop)
-- Senders listed in `slack.silent_senders` still trigger Claude, but their reply is not posted back — useful for alert/automation bots you want handled quietly
+- Senders listed in `slack.silent_senders` still trigger Claude with a plain message, but their reply is not posted back — useful for alert/automation bots you want handled quietly. Their `$` commands, slash commands, shortcuts and button taps are dropped, so they cannot stop, compact, pin a model, queue a job or continue a gated thread. The exact list, and the paths that can still post, are in [the reference](../reference/config-yaml.md#silent-senders)
 - A `slack.bot_policies` entry can narrow an allowed bot before agent dispatch. Under `selective`, a message reaches the agent only if it mentions the agent or matches one of your `process_if` patterns; everything else is dropped without consuming an agent turn
 - Claude responds in a thread — as you with a user token, or as the app with a bot token
 - Each thread = one Claude session. All threads of a DM, group DM or channel share one working directory and one conversation memory (`memory/notes.md` in that directory), on top of the per-person memory

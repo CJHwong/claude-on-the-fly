@@ -617,7 +617,8 @@ slack:
   # allowed_senders: [U012ABCDEF, B07JPABE2]
   # Everyone: allowed_senders: ["*"] -- must be quoted; a bare * is YAML alias syntax
   # blocked_senders: [B0NOISYBOT]   # wins over the allowlist
-  # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply
+  # silent_senders: [B0CRONBOT]     # trigger the agent, post no reply; their $ commands,
+  #                                 # slash commands and button taps are dropped
 
   # Optional per-bot gate, evaluated before a session or agent process is created.
   # Bot ids here must still appear in allowed_senders. Invalid policies log an

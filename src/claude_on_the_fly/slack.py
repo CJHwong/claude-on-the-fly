@@ -482,8 +482,9 @@ _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_foun
 
 # Trusted bots normally bypass the channel @mention gate. A per-bot policy can
 # narrow that trust before any session or agent process is created, which is
-# materially different from `silent_senders`: silence suppresses the final Slack
-# reply, while this gate prevents the agent run itself.
+# materially different from `silent_senders`: silence suppresses the reply to a
+# plain message (and drops commands and taps), while this gate prevents the agent
+# run itself.
 _BOT_POLICY_MODES = frozenset({"all", "selective", "drop"})
 
 # The one condition that is not a text match, so the one condition an operator
@@ -1681,6 +1682,34 @@ class SlackFrontend(Frontend):
     def _silent_sender_ids(self) -> set[str]:
         return self._senders("SLACK_SILENT_SENDER_IDS", self._pinned_silent_sender_ids)
 
+    def _is_silent(self, sender_id: str, bot_id: str = "") -> bool:
+        """Whether this sender is listed in `silent_senders`.
+
+        A silent sender is heard and never answered: a plain message runs a turn
+        whose reply is not posted, and everything else they can send (a `$`
+        command, a slash command, a shortcut, a button tap) is dropped where it
+        enters, before it posts or reaches the orchestrator. A bot post is listed
+        by its bot id, a person by their user id.
+        """
+        silent = self._silent_sender_ids
+        return bool(bot_id and bot_id in silent) or sender_id in silent
+
+    def _is_control_command(self, text: str) -> bool:
+        """Whether `text` is one of the `$` commands `_process_event` answers
+        itself rather than handing to the agent as a message."""
+        stripped = text.strip()
+        if stripped in (STOP_COMMAND, COMPACT_COMMAND):
+            return True
+        for command in (MODEL_COMMAND, CONTINUE_COMMAND):
+            if stripped == command or stripped.startswith(command + " "):
+                return True
+        job_command = self._job_command
+        return bool(
+            job_command
+            and self._job_queue is not None
+            and (stripped == job_command or stripped.startswith(job_command + " "))
+        )
+
     def _bot_policy(self, bot_id: str) -> _BotPolicy | None:
         """Return the bot's optional policy, re-reading operator config live."""
         policies: object
@@ -2248,6 +2277,9 @@ class SlackFrontend(Frontend):
         if not self._is_allowed(sender_id):
             logger.warning("slack: ignoring approval click from %s", sender_id)
             return
+        if self._is_silent(sender_id):
+            logger.info("slack: dropping approval click from silent %s", sender_id)
+            return
         action = actions[0]
         nonce = action.get("value", "")
         future = self._pending_approvals.get(nonce)
@@ -2269,6 +2301,11 @@ class SlackFrontend(Frontend):
         sender_id = (body.get("user") or {}).get("id", "")
         if not self._is_allowed(sender_id):
             logger.warning("slack: ignoring suggestion click from %s", sender_id)
+            return
+        # Dropped before the menu is retired: that edit is visible in the thread,
+        # and a silent sender's tap must leave no trace there.
+        if self._is_silent(sender_id):
+            logger.info("slack: dropping suggestion click from silent %s", sender_id)
             return
         # The label comes straight from the clicked button's payload: it is
         # the label we rendered, so no per-message state and no index
@@ -2360,6 +2397,9 @@ class SlackFrontend(Frontend):
         if not self._is_allowed(sender_id):
             logger.warning("slack: ignoring continue click from %s", sender_id)
             return
+        if self._is_silent(sender_id):
+            logger.info("slack: dropping continue click from silent %s", sender_id)
+            return
         routing = _parse_continue_value(actions[0].get("value", ""))
         if routing is None:
             logger.info("slack: continue click with unusable routing, dropping")
@@ -2397,6 +2437,9 @@ class SlackFrontend(Frontend):
         sender_id = (body.get("user") or {}).get("id", "")
         if not self._is_allowed(sender_id):
             logger.warning("slack: ignoring replay click from %s", sender_id)
+            return
+        if self._is_silent(sender_id):
+            logger.info("slack: dropping replay click from silent %s", sender_id)
             return
         routing = _parse_continue_value(actions[0].get("value", ""))
         if routing is None:
@@ -2573,6 +2616,12 @@ class SlackFrontend(Frontend):
             await ack()
             await respond("Not authorized.")
             return
+        if self._is_silent(user_id):
+            # Acknowledged so Slack does not show the user an error, and nothing
+            # else: no response, no anchor, no picker, no turn.
+            logger.info("slack: slash command from silent %s dropped", user_id)
+            await ack()
+            return
         # A bare command opens the picker; anything else is forwarded verbatim as a
         # `/skill args` prompt. Turn control (stop/continue) is the $stop/$continue
         # text prefix instead, since it must work inside threads where slash
@@ -2597,6 +2646,9 @@ class SlackFrontend(Frontend):
             logger.info(
                 "slack: run-skill shortcut from %s denied (not allowed)", user_id
             )
+            return
+        if self._is_silent(user_id):
+            logger.info("slack: run-skill shortcut from silent %s dropped", user_id)
             return
         message = shortcut.get("message") or {}
         # A message shortcut carries the message it fired on; use its thread so
@@ -2677,6 +2729,9 @@ class SlackFrontend(Frontend):
             return
         if not self._is_allowed(user_id):
             logger.info("slack: picker submit from %s denied (not allowed)", user_id)
+            return
+        if self._is_silent(user_id):
+            logger.info("slack: picker submit from silent %s dropped", user_id)
             return
         prompt = f"/{skill} {args}".strip()
         thread_ts = await self._anchor_run(
@@ -2889,6 +2944,8 @@ class SlackFrontend(Frontend):
         # and, after a restart skipped the empty journaled value, the numeric
         # chat id.
         sender_id = event.get("user") or bot_id
+        # Decided once, here, ahead of every gate below that can answer.
+        silent = self._is_silent(sender_id, bot_id)
         if ts in self._our_sent_timestamps:
             self._skip(False, "our own message ts=%s", ts)
             return
@@ -2998,9 +3055,10 @@ class SlackFrontend(Frontend):
                 mention = f"<@{self._user_id}>"
                 if mention not in text:
                     self._skip(False, "no mention of %s in text", self._user_id)
-                    await self._hint_mention_required(
-                        channel, thread_ts, sender_id, event
-                    )
+                    if not silent:
+                        await self._hint_mention_required(
+                            channel, thread_ts, sender_id, event
+                        )
                     return
                 # Remember who tagged, so a later untagged message can be matched
                 # against them rather than nudging whoever happened to speak next.
@@ -3022,6 +3080,27 @@ class SlackFrontend(Frontend):
             ):
                 self._skip(False, "%s is not a DM the bot is in", channel)
                 return
+
+        # A silent sender's control command is dropped here, before it can post an
+        # acknowledgement or reach the orchestrator: no abort, compaction, model
+        # pin, job or turn. `$continue <text>` goes whole, trailing text included.
+        # Marked processed so a reconnect does not read it again. A button replay
+        # is judged on what the sender typed, not on the `$continue` or the tag
+        # the bridge put in front of it; a catch-up re-read carries no original
+        # and is judged like a live message.
+        said = text
+        if original_event is not None:
+            said = re.sub(f"<@{self._user_id}>\\s*", "", original_event.get("text", ""))
+        if silent and self._is_control_command(said):
+            logger.info(
+                "slack %s/%s: dropped a command from silent %s",
+                channel,
+                thread_ts,
+                sender_id,
+            )
+            self._processed_ts.add(ts)
+            self._record_watermark(channel, ts, channel_type, thread_ts)
+            return
 
         session_id = _session_key(channel, thread_ts)
         is_new_session = session_id not in self._sessions
@@ -3235,9 +3314,12 @@ class SlackFrontend(Frontend):
             # stays unprocessed: the Continue button replays it from the backlog.
             self._record_watermark(channel, ts, channel_type, thread_ts)
             await self._mark_gated(session_id, event)
-            self._schedule_reply_limit_warning(
-                session_id, channel, thread_ts, sender_id
-            )
+            # A silent sender is gated with no notice, and must not replace one
+            # already pending for somebody else in the thread.
+            if not silent:
+                self._schedule_reply_limit_warning(
+                    session_id, channel, thread_ts, sender_id
+                )
             return
 
         thread_context = ""
@@ -3288,9 +3370,6 @@ class SlackFrontend(Frontend):
         self._record_watermark(channel, ts, channel_type, thread_ts)
 
         self._pending_msg.setdefault(session_id, deque()).append((channel, ts))
-        silent = bool(bot_id and bot_id in self._silent_sender_ids) or (
-            sender_id in self._silent_sender_ids
-        )
         self._pending_reply_suppressed.setdefault(session_id, deque()).append(silent)
         preview = text[:80] if text else "(forward only)"
         fwd_marker = f" (+{len(forwards)} fwd)" if forwards else ""
