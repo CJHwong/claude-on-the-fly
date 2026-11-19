@@ -446,22 +446,26 @@ A sender in `silent_senders` is heard and never answered. It must also be allowe
 - **A plain message** runs a turn as usual, and the turn's reply is not posted.
 - **A `$` command is dropped** before it posts or reaches the agent: `$stop`,
   `$compact`, `$model`, `$continue` (with any text after it, which does not run),
-  and the `job_command` trigger, bare or with a task. Nothing is aborted,
-  compacted, pinned or queued, and the message is marked processed.
+  and the `job_command` trigger, bare or with a task, while the job queue is on.
+  Nothing is aborted, compacted, pinned or queued, a dropped `$continue` leaves
+  the thread's gated backlog in place, and the message is marked processed. Text
+  that only looks like a command (`$stop now`, or the trigger with the queue off)
+  is a plain message.
 - **A slash command, message shortcut or skill-picker submit is dropped.** Slack
   gets its acknowledgement and nothing else: no response, no anchor message, no
   picker, no turn.
 - **A button tap is dropped**: a suggestion button, the Continue and replay
   buttons on the gate and mention notices, and an approval card's buttons. A
-  dropped suggestion tap leaves the menu as it was.
+  dropped suggestion tap leaves the menu as it was. A silent person cannot answer
+  the approval card on their own turn: somebody else must, or the request is
+  denied when it times out.
 - **No notices.** An untagged channel message gets no mention notice. A message
   over the reply soft-limit is gated (it takes the lock reaction and waits in the
   thread's backlog) with no notice, and a notice already pending for somebody
-  else in the thread is left as it is. The silent sender cannot clear the gate
-  themselves. When somebody else presses the Continue button on their own gate
-  notice, the thread's backlog runs, the silent sender's messages included; when
-  somebody else types `$continue`, the thread resumes and the backlog is
-  discarded.
+  else in the thread is left as it is. The silent sender cannot clear the gate.
+  Somebody else can: the Continue button on that person's own gate notice runs
+  the thread's backlog, the silent sender's messages included, and a typed
+  `$continue` from that person resumes the thread and discards the backlog.
 
 What still shows for a silent sender's plain message: the reactions on it, the
 assistant status line under a bot token, and an approval card if the turn needs
@@ -472,10 +476,12 @@ a grant. Two paths can still post a silent sender's reply:
   that posts in the thread;
 - automatic compaction (`agent.auto_compact_pct`) queues a compaction turn that
   takes the triggering message's reply entry, so the turns behind it in that
-  thread take the entry of the turn after them, and the last one posts.
+  thread take the entry of the turn after them, and the last one posts. The same
+  shift can drop a reply owed to a sender who is not silent.
 
-A non-silent person's slash or picker run queued in the same thread can shift
-the entries the same way.
+A skill-picker run that a non-silent person starts from the message shortcut
+shifts the entries the same way when a silent sender's message queues behind it
+in that thread: the silent sender's reply posts and the run's reply is dropped.
 
 ## `telegram`
 

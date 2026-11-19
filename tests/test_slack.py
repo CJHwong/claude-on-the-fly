@@ -8727,9 +8727,14 @@ class TestSilentSendersAreHeardNotAnswered:
         session_id = _session_key("D1", "9.0")
         fe._reply_counts[session_id] = 3
 
-        await fe._ingest_event(self._dm("9.0", text))
+        with patch.object(
+            fe, "_record_watermark", wraps=fe._record_watermark
+        ) as watermark:
+            await fe._ingest_event(self._dm("9.0", text))
 
         assert self._posts(fe) == 0
+        # Marked as read, so a reconnect does not fetch the command again.
+        watermark.assert_called_once_with("D1", "9.0", "im", "9.0")
         # Health bookkeeping after every handled event is not a command.
         called = [c[0] for c in orch.mock_calls if c[0] != "note_handler_success"]
         assert called == []
@@ -8739,6 +8744,96 @@ class TestSilentSendersAreHeardNotAnswered:
         # `$continue <text>` goes whole: no reset, and the text does not run.
         assert fe._reply_counts[session_id] == 3
         assert "9.0" in fe._processed_ts
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "$stop now",
+            "$compactness",
+            "$modeling",
+            "$jobs",
+            "$STOP",
+            "$continue\nmore",
+        ],
+    )
+    async def test_text_that_only_looks_like_a_command_still_runs(self, text):
+        """Only what a command branch would answer is dropped. Anything else is
+        a plain message, and a silent sender's plain message runs."""
+        fe = self._frontend({"U_ALLOWED"})
+        orch = self._orchestrator()
+        fe._orchestrator = orch
+
+        await fe._ingest_event(self._dm("9.0", text))
+
+        fe._on_message.assert_awaited_once()
+        orch.abort.assert_not_awaited()
+        orch.on_compact.assert_not_awaited()
+        assert list(fe._pending_reply_suppressed[_session_key("D1", "9.0")]) == [True]
+        assert self._posts(fe) == 0
+
+    @pytest.mark.parametrize("text", ["$job", "$job summarize the incident"])
+    async def test_the_job_trigger_with_the_queue_off_is_plain_text(self, text):
+        fe = self._frontend({"U_ALLOWED"})
+        fe._job_queue = None
+
+        await fe._ingest_event(self._dm("9.0", text))
+
+        fe._on_message.assert_awaited_once()
+        assert list(fe._pending_reply_suppressed[_session_key("D1", "9.0")]) == [True]
+        assert self._posts(fe) == 0
+
+    @pytest.mark.parametrize("user", ["U_ALLOWED", "U_LOUD"])
+    async def test_a_continue_replay_that_failed_still_runs_on_retry(self, user):
+        """A Continue replay that raises is kept by the failed-event store with
+        the bridge's `$continue` in front of its text, and catch-up retries it
+        with no original event. It is still the sender's plain message."""
+        fe = self._frontend({"U_ALLOWED"})
+        now = f"{time.time():.6f}"  # inside the failed-event store's window
+        gated = {
+            "ts": now,
+            "thread_ts": "t1",
+            "text": "<@U_SELF> disk is at 91%",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": user,
+        }
+        real = fe._identify_session
+        calls = 0
+
+        async def fails_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("transient")
+            return await real(*args, **kwargs)
+
+        fe._identify_session = fails_once
+        with pytest.raises(RuntimeError):
+            await fe._replay_gated("C1", [gated])
+        fe._on_message.assert_not_awaited()
+
+        await fe._replay_failed_events()
+
+        fe._on_message.assert_awaited_once()
+        assert list(fe._pending_reply_suppressed[_session_key("C1", "t1")]) == [
+            user == "U_ALLOWED"
+        ]
+
+    async def test_a_tagged_dm_that_reads_like_a_command_runs_live_and_replayed(
+        self,
+    ):
+        """In a DM the bot's tag is not taken off, so `<@bot> $model opus` is a
+        plain message there. Replayed by Continue it must be judged the same."""
+        fe = self._frontend({"U_ALLOWED"})
+        orch = self._orchestrator()
+        fe._orchestrator = orch
+        live = self._dm("80.0", "<@U_SELF> $model opus")
+
+        await fe._ingest_event(dict(live))
+        await fe._replay_gated("D1", [{**live, "ts": "81.0"}])
+
+        assert fe._on_message.await_count == 2
+        orch.on_model.assert_not_called()
 
     async def test_a_tagged_command_in_a_channel_is_dropped(self):
         fe = self._frontend({"U_ALLOWED"})

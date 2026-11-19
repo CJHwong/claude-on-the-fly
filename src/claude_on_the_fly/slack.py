@@ -477,6 +477,9 @@ _DOWNLOAD_CHUNK = 64 * 1024
 # the subtype filter and never reached the relay. Everything downstream treats it
 # as the plain reply it is: same sender gates, same @mention gate, same thread.
 _ALLOWED_SUBTYPES = {"file_share", "thread_broadcast"}
+# A private key on a Continue replay's event dict: the text the sender typed,
+# before `_replay_gated` put `$continue` in front of it. Slack never sends it.
+_TYPED_TEXT_KEY = "_cotf_typed_text"
 _FALLBACK_ERRORS = frozenset({"not_in_channel", "is_archived", "channel_not_found"})
 
 
@@ -1694,21 +1697,33 @@ class SlackFrontend(Frontend):
         silent = self._silent_sender_ids
         return bool(bot_id and bot_id in silent) or sender_id in silent
 
-    def _is_control_command(self, text: str) -> bool:
-        """Whether `text` is one of the `$` commands `_process_event` answers
-        itself rather than handing to the agent as a message."""
+    def _control_command(self, text: str) -> str | None:
+        """Name the `$` command `text` is, or None for a plain message.
+
+        The one parser: `_process_event`'s command branches dispatch on it, and
+        the silent-sender drop asks it, so a command cannot be answered in one
+        place and missed in the other. `$stop` and `$compact` match exactly;
+        `$model`, the job trigger and `$continue` take arguments. The trigger is
+        a command only while the job queue is on; otherwise it is plain text.
+        Checked in the order the branches used to test them.
+        """
         stripped = text.strip()
-        if stripped in (STOP_COMMAND, COMPACT_COMMAND):
-            return True
-        for command in (MODEL_COMMAND, CONTINUE_COMMAND):
-            if stripped == command or stripped.startswith(command + " "):
-                return True
+
+        def takes_args(command: str) -> bool:
+            return stripped == command or stripped.startswith(command + " ")
+
+        if stripped == STOP_COMMAND:
+            return "stop"
+        if stripped == COMPACT_COMMAND:
+            return "compact"
+        if takes_args(MODEL_COMMAND):
+            return "model"
         job_command = self._job_command
-        return bool(
-            job_command
-            and self._job_queue is not None
-            and (stripped == job_command or stripped.startswith(job_command + " "))
-        )
+        if job_command and self._job_queue is not None and takes_args(job_command):
+            return "job"
+        if takes_args(CONTINUE_COMMAND):
+            return "continue"
+        return None
 
     def _bot_policy(self, bot_id: str) -> _BotPolicy | None:
         """Return the bot's optional policy, re-reading operator config live."""
@@ -2503,6 +2518,9 @@ class SlackFrontend(Frontend):
         for event in events:
             ts = str(event.get("ts") or "")
             replay = dict(event)
+            replay[_TYPED_TEXT_KEY] = event.get(
+                _TYPED_TEXT_KEY, event.get("text") or ""
+            )
             replay["text"] = f"{CONTINUE_COMMAND} {event.get('text') or ''}".strip()
             await self._ingest_event(replay, original_event=event, replayed=True)
             # `_ingest_event` returns nothing whether it ran the message or
@@ -2946,6 +2964,11 @@ class SlackFrontend(Frontend):
         sender_id = event.get("user") or bot_id
         # Decided once, here, ahead of every gate below that can answer.
         silent = self._is_silent(sender_id, bot_id)
+        # What the sender typed. A Continue replay carries it under a private key,
+        # because the bridge puts `$continue` in front of the replay's text, and
+        # that key survives the failed-event store with the rest of the dict.
+        typed = str(event.get(_TYPED_TEXT_KEY, event.get("text", "")))
+        untagged = False
         if ts in self._our_sent_timestamps:
             self._skip(False, "our own message ts=%s", ts)
             return
@@ -3030,6 +3053,7 @@ class SlackFrontend(Frontend):
                 # it. A bot accepted by `explicit_mention` used to hand the
                 # agent a prompt still carrying the raw `<@U...>`.
                 text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
+                untagged = True
                 logger.info(
                     "trusted bot_message accepted: bot_id=%s policy_reason=%s",
                     bot_id,
@@ -3069,6 +3093,7 @@ class SlackFrontend(Frontend):
                     _session_key(channel, thread_ts), set()
                 ).add(sender_id)
                 text = re.sub(f"<@{self._user_id}>\\s*", "", text).strip()
+                untagged = True
 
             # Under a bot token the app also receives the authorizing user's own
             # DMs with third parties (via the user-token grant); those aren't
@@ -3084,14 +3109,12 @@ class SlackFrontend(Frontend):
         # A silent sender's control command is dropped here, before it can post an
         # acknowledgement or reach the orchestrator: no abort, compaction, model
         # pin, job or turn. `$continue <text>` goes whole, trailing text included.
-        # Marked processed so a reconnect does not read it again. A button replay
-        # is judged on what the sender typed, not on the `$continue` or the tag
-        # the bridge put in front of it; a catch-up re-read carries no original
-        # and is judged like a live message.
-        said = text
-        if original_event is not None:
-            said = re.sub(f"<@{self._user_id}>\\s*", "", original_event.get("text", ""))
-        if silent and self._is_control_command(said):
+        # Marked processed so a reconnect does not read it again. Judged on what
+        # the sender typed, with the bot's tag taken off only where the gates
+        # above took it off, so a replay or a retry is judged as the live message
+        # was.
+        said = re.sub(f"<@{self._user_id}>\\s*", "", typed) if untagged else typed
+        if silent and self._control_command(said) is not None:
             logger.info(
                 "slack %s/%s: dropped a command from silent %s",
                 channel,
@@ -3121,7 +3144,8 @@ class SlackFrontend(Frontend):
         # $stop aborts this thread's in-flight turn. Checked before the soft-limit
         # gate so a stop lands even when the thread is over budget. Works in
         # threads (it's a message, not a slash command).
-        if text.strip() == STOP_COMMAND:
+        command = self._control_command(text)
+        if command == "stop":
             logger.info("slack %s/%s: %s", channel, thread_ts, STOP_COMMAND)
             # Before the abort, like $compact: unmarked, every reconnect re-read
             # this stop and aborted whatever turn ran next.
@@ -3143,7 +3167,7 @@ class SlackFrontend(Frontend):
         # large thread, and silence is indistinguishable from a hung daemon.
         # Ahead of the soft-limit gate for the same reason as $stop: a thread
         # over budget is the one that most needs this to still work.
-        if text.strip() == COMPACT_COMMAND:
+        if command == "compact":
             logger.info("slack %s/%s: %s", channel, thread_ts, COMPACT_COMMAND)
             # This branch returns before the normal path's catch-up bookkeeping,
             # so mirror it here or a reconnect re-ingests the trigger and
@@ -3183,8 +3207,8 @@ class SlackFrontend(Frontend):
         # thread over budget is exactly one somebody may want to move to a
         # cheaper model. `checks._job_command_error` refuses a job trigger that
         # would collide with this prefix, so the two cannot both claim it.
-        model_text = text.strip()
-        if model_text == MODEL_COMMAND or model_text.startswith(MODEL_COMMAND + " "):
+        if command == "model":
+            model_text = text.strip()
             logger.info("slack %s/%s: %s", channel, thread_ts, MODEL_COMMAND)
             # This branch returns before the normal path's catch-up bookkeeping,
             # so mirror it here or a reconnect re-ingests the command.
@@ -3219,13 +3243,8 @@ class SlackFrontend(Frontend):
         # isn't assigned yet — and the notifier reads neither, so origin carries
         # sender_id.
         job_command = self._job_command
-        job_text = text.strip()
-        if (
-            job_command
-            and self._job_queue is not None
-            and (job_text == job_command or job_text.startswith(job_command + " "))
-        ):
-            task = job_text[len(job_command) :].strip()
+        if command == "job" and job_command and self._job_queue is not None:
+            task = text.strip()[len(job_command) :].strip()
             # Unlike $stop, $job is not idempotent — a catchup re-ingest on
             # reconnect would enqueue a second job. Mirror the normal path's
             # catch-up bookkeeping (which this branch returns before reaching):
@@ -3290,7 +3309,7 @@ class SlackFrontend(Frontend):
         # trailing text is processed as the next turn; otherwise, once the
         # thread is over budget we post the warning and stop here (no agent run).
         stripped = text.strip()
-        if stripped == CONTINUE_COMMAND or stripped.startswith(CONTINUE_COMMAND + " "):
+        if command == "continue":
             self._reply_counts[session_id] = 0
             # A notice still waiting out its delay would land after the thread
             # has already resumed, telling the user to send what they just sent.
